@@ -1,49 +1,54 @@
-name: Deploy
+name: Deploy to VPS
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy files to server
-        uses: appleboy/scp-action@v0.1.7
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@v2
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
-          source: "."
-          target: "/opt/memebot"
-          # Never overwrite live data or secrets
-          exclude: ".git,data,.env"
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          known_hosts: unnecessary
 
-      - name: Deploy on server
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
-          script: |
+      - name: Deploy to VPS
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST << 'EOF'
             set -e
-            cd /opt/memebot
+            DEPLOY_DIR="/opt/apps/$REPO_NAME"
 
-            # Write .env from GitHub Secrets (overwrites only on deploy)
-            cat > .env <<'ENVEOF'
-            TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}
-            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
-            CHANNEL_USERNAME=${{ secrets.CHANNEL_USERNAME }}
-            DUMP_CHAT_ID=${{ secrets.DUMP_CHAT_ID }}
-            ADMIN_ID=${{ secrets.ADMIN_ID }}
-            ENVEOF
+            mkdir -p "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
 
+            # Clone or pull latest code
+            if [ -d ".git" ]; then
+              git pull
+            else
+              git clone https://github.com/${{ github.repository }}.git .
+            fi
+
+            # .env должен лежать на сервере вручную (chmod 600 .env)
+            if [ ! -f ".env" ]; then
+              echo "ERROR: .env not found at $DEPLOY_DIR/.env" >&2
+              exit 1
+            fi
+
+            docker compose down
             docker compose build --no-cache
             docker compose up -d
             docker image prune -f
+
+            echo "Deployed successfully"
+          EOF

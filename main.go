@@ -30,6 +30,7 @@ type Config struct {
 	DumpChatID      int64
 	AdminID         int64
 	DBPath          string
+	DevMode         bool // APP_ENV=dev
 }
 
 func loadConfig() Config {
@@ -56,6 +57,8 @@ func loadConfig() Config {
 		dbPath = "/app/data/memes.db"
 	}
 
+	devMode := os.Getenv("APP_ENV") == "dev"
+
 	return Config{
 		TelegramToken:   must("TELEGRAM_TOKEN"),
 		GeminiAPIKey:    must("GEMINI_API_KEY"),
@@ -63,6 +66,7 @@ func loadConfig() Config {
 		DumpChatID:      dumpChatID,
 		AdminID:         adminID,
 		DBPath:          dbPath,
+		DevMode:         devMode,
 	}
 }
 
@@ -102,6 +106,15 @@ func initDB(path string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func resetDB(db *sql.DB) error {
+	_, err := db.Exec(`
+		DELETE FROM memes;
+		DELETE FROM indexed_msgs;
+		DELETE FROM crawler_state;
+	`)
+	return err
 }
 
 func isAlreadyIndexed(db *sql.DB, msgID int) (bool, error) {
@@ -150,9 +163,9 @@ func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
 		if err := rows.Scan(&fileID, &rowid); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		results = append(results, &tele.CachedPhoto{
+		results = append(results, &tele.PhotoResult{
 			ResultBase: tele.ResultBase{ID: strconv.FormatInt(rowid, 10)},
-			FileID:     fileID,
+			Cache:      fileID,
 		})
 	}
 
@@ -237,7 +250,12 @@ type geminiInlineData struct {
 	Data     string `json:"data"` // base64-encoded
 }
 
-const geminiPrompt = "Опиши сцену на картинке 1-2 предложениями и полностью перепиши весь текст из комикса или мема. Отвечай только по-русски."
+const geminiPrompt = `Проанализируй мем или комикс и ответь в двух частях:
+1. Описание: что происходит на картинке (1-2 предложения на русском).
+2. Текст: перепиши дословно весь текст с картинки, сохраняя оригинальный язык и написание брендов, имён, мемных фраз. Если текста нет — напиши "Текст отсутствует".
+Формат ответа:
+Описание: ...
+Текст: ...`
 
 // describeImage fetches an image from Telegram by file_id and sends it to Gemini.
 func describeImage(cfg Config, fileID string) (string, error) {
@@ -289,7 +307,7 @@ func describeImage(cfg Config, fileID string) (string, error) {
 
 	// Step 3: call Gemini REST API
 	geminiURL := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s",
+		"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=%s",
 		cfg.GeminiAPIKey,
 	)
 
@@ -358,44 +376,54 @@ func sendAdminAlert(bot *tele.Bot, adminID int64, msg string) {
 // ─── Worker Pool ──────────────────────────────────────────────────────────────
 
 type indexJob struct {
-	fileID string
-	msgID  int
+	fileID  string
+	msgID   int
+	replyTo int64 // if > 0, send AI result back to this chat (admin DM)
 }
 
-// runWorker consumes jobs from jobChan, gated by a 4.5-second ticker to stay
-// within Gemini Free Tier limits (15 req/min).
+// runWorker consumes jobs from jobChan, gated by a ticker to stay within
+// Gemini rate limits: 5 req/min → 1 req / 12 s.
 func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
 	ticker := time.NewTicker(4500 * time.Millisecond)
 	defer ticker.Stop()
 
-	log.Println("worker pool started (rate limit: 1 req / 4.5 s)")
+	log.Println("worker pool started (rate limit: 1 req / 4.5 s → 13 req/min)")
 
 	for job := range jobChan {
 		<-ticker.C // wait for the rate-limit window
 
-		already, err := isAlreadyIndexed(db, job.msgID)
-		if err != nil {
-			log.Printf("worker: db check error msg_id=%d: %v", job.msgID, err)
-		} else if already {
-			log.Printf("worker: msg_id=%d already indexed, skipping", job.msgID)
-			continue
+		// Skip dedup for admin DM photos (replyTo > 0, no channel msgID)
+		if job.replyTo == 0 {
+			already, err := isAlreadyIndexed(db, job.msgID)
+			if err != nil {
+				log.Printf("worker: db check error msg_id=%d: %v", job.msgID, err)
+			} else if already {
+				log.Printf("worker: msg_id=%d already indexed, skipping", job.msgID)
+				continue
+			}
 		}
 
 		log.Printf("worker: describing msg_id=%d file_id=%s", job.msgID, job.fileID)
 
 		desc, err := describeImage(cfg, job.fileID)
 		if err != nil {
-			sendAdminAlert(bot, cfg.AdminID, fmt.Sprintf(
-				"Gemini failed for msg_id=%d file_id=%s: %v", job.msgID, job.fileID, err,
-			))
+			errMsg := fmt.Sprintf("Gemini failed for msg_id=%d file_id=%s: %v", job.msgID, job.fileID, err)
+			sendAdminAlert(bot, cfg.AdminID, errMsg)
+			if job.replyTo > 0 {
+				chat := &tele.Chat{ID: job.replyTo}
+				bot.Send(chat, "❌ Ошибка Gemini: "+err.Error())
+			}
 			continue
 		}
 
-		if err := saveMeme(db, job.fileID, job.msgID, desc); err != nil {
-			sendAdminAlert(bot, cfg.AdminID, fmt.Sprintf(
-				"DB save failed for msg_id=%d: %v", job.msgID, err,
-			))
-			continue
+		// Save to DB: always for channel photos; in dev mode also for admin DM photos
+		if job.replyTo == 0 || cfg.DevMode {
+			if err := saveMeme(db, job.fileID, job.msgID, desc); err != nil {
+				sendAdminAlert(bot, cfg.AdminID, fmt.Sprintf(
+					"DB save failed for msg_id=%d: %v", job.msgID, err,
+				))
+				continue
+			}
 		}
 
 		preview := desc
@@ -403,6 +431,19 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
 			preview = preview[:100] + "…"
 		}
 		log.Printf("worker: indexed msg_id=%d — %s", job.msgID, preview)
+
+		// Send result back: admin DM reply, or dev mode notification
+		if job.replyTo > 0 {
+			chat := &tele.Chat{ID: job.replyTo}
+			if _, err := bot.Send(chat, desc); err != nil {
+				log.Printf("worker: reply failed: %v", err)
+			}
+		} else if cfg.DevMode {
+			admin := &tele.User{ID: cfg.AdminID}
+			if _, err := bot.Send(admin, fmt.Sprintf("✅ msg_id=%d\n\n%s", job.msgID, desc)); err != nil {
+				log.Printf("worker: dev notify failed: %v", err)
+			}
+		}
 	}
 }
 
@@ -419,24 +460,31 @@ func (m channelMsg) MessageSig() (string, int64) {
 	return strconv.Itoa(m.id), m.chatID
 }
 
-// crawlHistory iterates message IDs from 1 upward, copying each post to the
+// crawlHistory iterates message IDs from 1 upward, forwarding each post to the
 // dump chat to obtain its file_id. It resumes from where it left off on restart.
-func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpChat *tele.Chat, jobChan chan<- indexJob) {
+// photoLimit > 0 stops after that many photos are enqueued (dev mode).
+func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpChat *tele.Chat, jobChan chan<- indexJob, photoLimit int) {
 	lastStr, err := getCrawlerState(db, "last_crawled_msg_id")
 	if err != nil {
 		log.Printf("crawler: cannot read state: %v", err)
 		lastStr = "0"
 	}
 	startID, _ := strconv.Atoi(lastStr)
-	log.Printf("crawler: starting from msg_id=%d", startID+1)
+	log.Printf("crawler: starting from msg_id=%d (photoLimit=%d)", startID+1, photoLimit)
 
 	const maxGap = 100 // consecutive misses before we consider history exhausted
 	consecutiveMisses := 0
+	photosEnqueued := 0
 
 	for msgID := startID + 1; ; msgID++ {
+		if photoLimit > 0 && photosEnqueued >= photoLimit {
+			log.Printf("crawler: dev limit reached (%d photos), stopping", photoLimit)
+			break
+		}
+
 		time.Sleep(60 * time.Millisecond) // ~16 req/s to Telegram, well under flood limit
 
-		copied, err := bot.Copy(dumpChat, channelMsg{id: msgID, chatID: channelID})
+		copied, err := bot.Forward(dumpChat, channelMsg{id: msgID, chatID: channelID})
 		if err != nil {
 			consecutiveMisses++
 			if consecutiveMisses >= maxGap {
@@ -452,8 +500,10 @@ func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpCh
 			log.Printf("crawler: cannot save state: %v", saveErr)
 		}
 
+		// bot.Forward populates the full message, but ensure Chat is set for Delete
+		copied.Chat = dumpChat
+
 		if copied.Photo == nil {
-			// Not a photo — discard the copy
 			if delErr := bot.Delete(copied); delErr != nil {
 				log.Printf("crawler: delete non-photo copy msg_id=%d: %v", msgID, delErr)
 			}
@@ -463,12 +513,12 @@ func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpCh
 		fileID := copied.Photo.FileID
 		log.Printf("crawler: photo msg_id=%d file_id=%s", msgID, fileID)
 
-		// Remove the temporary copy from the dump chat
 		if delErr := bot.Delete(copied); delErr != nil {
 			log.Printf("crawler: delete photo copy msg_id=%d: %v", msgID, delErr)
 		}
 
 		jobChan <- indexJob{fileID: fileID, msgID: msgID}
+		photosEnqueued++
 	}
 
 	log.Println("crawler: history scan complete")
@@ -548,6 +598,21 @@ func main() {
 		return nil
 	})
 
+	// Admin DM: photo sent directly to the bot → describe via AI and reply
+	bot.Handle(tele.OnPhoto, func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		msg := c.Message()
+		fileID := msg.Photo.FileID
+		log.Printf("admin DM: photo received file_id=%s", fileID)
+		if _, err := c.Bot().Send(c.Chat(), "⏳ Добавлено в очередь..."); err != nil {
+			log.Printf("admin DM: ack send failed: %v", err)
+		}
+		jobChan <- indexJob{fileID: fileID, msgID: 0, replyTo: c.Chat().ID}
+		return nil
+	})
+
 	// Inline search handler
 	bot.Handle(tele.OnQuery, func(c tele.Context) error {
 		query := strings.TrimSpace(c.Query().Text)
@@ -576,7 +641,38 @@ func main() {
 	})
 
 	dumpChat := &tele.Chat{ID: cfg.DumpChatID}
-	go crawlHistory(bot, db, cfg, channelID, dumpChat, jobChan)
+
+	if cfg.DevMode {
+		// In dev mode crawling only starts on /index <n> command from admin
+		bot.Handle("/index", func(c tele.Context) error {
+			if c.Chat().ID != cfg.AdminID {
+				return nil
+			}
+
+			n := 10
+			if arg := c.Message().Payload; arg != "" {
+				if parsed, err := strconv.Atoi(arg); err == nil && parsed > 0 {
+					n = parsed
+				}
+			}
+
+			log.Printf("admin: /index %d — resetting DB and starting crawl", n)
+			if err := resetDB(db); err != nil {
+				return c.Send("❌ Ошибка сброса БД: " + err.Error())
+			}
+
+			if err := c.Send(fmt.Sprintf("🔄 Запускаю индексацию %d фото с начала канала...", n)); err != nil {
+				log.Printf("admin: send failed: %v", err)
+			}
+
+			go crawlHistory(bot, db, cfg, channelID, dumpChat, jobChan, n)
+			return nil
+		})
+
+		log.Println("DEV MODE: crawler on hold — send /index <n> to start")
+	} else {
+		go crawlHistory(bot, db, cfg, channelID, dumpChat, jobChan, 0)
+	}
 
 	log.Println("memebot running")
 	bot.Start()

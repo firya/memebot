@@ -1,6 +1,6 @@
 module memebot
 
-go 1.22
+go 1.24.7
 
 require (
 	github.com/kljensen/snowball v0.10.0

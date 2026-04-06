@@ -1,7 +1,14 @@
 services:
   memebot:
     build: .
+    container_name: memebot
     restart: unless-stopped
     env_file: .env
     volumes:
       - ./data:/app/data
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
