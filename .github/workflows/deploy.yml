@@ -1,0 +1,49 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          source: "."
+          target: "/opt/memebot"
+          # Never overwrite live data or secrets
+          exclude: ".git,data,.env"
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+            cd /opt/memebot
+
+            # Write .env from GitHub Secrets (overwrites only on deploy)
+            cat > .env <<'ENVEOF'
+            TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+            CHANNEL_USERNAME=${{ secrets.CHANNEL_USERNAME }}
+            DUMP_CHAT_ID=${{ secrets.DUMP_CHAT_ID }}
+            ADMIN_ID=${{ secrets.ADMIN_ID }}
+            ENVEOF
+
+            docker compose build --no-cache
+            docker compose up -d
+            docker image prune -f
