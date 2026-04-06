@@ -314,7 +314,7 @@ func describeImage(cfg Config, fileID string) (string, error) {
 	claudeURL := "https://api.anthropic.com/v1/messages"
 
 	reqBody := claudeRequest{
-		Model:     "claude-haiku-4-5", // Haiku is fast, cheap and supports vision
+		Model:     "claude-haiku-4-5-20251001", // Haiku is fast, cheap and supports vision
 		MaxTokens: 1000,
 		Messages: []claudeMessage{
 			{
@@ -437,14 +437,12 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
 			continue
 		}
 
-		// Save to DB: always for channel photos; in dev mode also for admin DM photos
-		if job.replyTo == 0 || cfg.DevMode {
-			if err := saveMeme(db, job.fileID, job.msgID, desc); err != nil {
-				sendAdminAlert(bot, cfg.AdminID, fmt.Sprintf(
-					"DB save failed for msg_id=%d: %v", job.msgID, err,
-				))
-				continue
-			}
+		// Save to DB always — channel photos and admin DM photos alike
+		if err := saveMeme(db, job.fileID, job.msgID, desc); err != nil {
+			sendAdminAlert(bot, cfg.AdminID, fmt.Sprintf(
+				"DB save failed for msg_id=%d: %v", job.msgID, err,
+			))
+			continue
 		}
 
 		preview := desc
@@ -519,6 +517,13 @@ func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpCh
 		// Persist progress immediately
 		if saveErr := setCrawlerState(db, "last_crawled_msg_id", strconv.Itoa(msgID)); saveErr != nil {
 			log.Printf("crawler: cannot save state: %v", saveErr)
+		}
+
+		if msgID%100 == 0 {
+			var total int
+			db.QueryRow("SELECT count(*) FROM memes").Scan(&total)
+			log.Printf("crawler: progress msg_id=%d | photos enqueued=%d | indexed=%d | queue=%d",
+				msgID, photosEnqueued, total, len(jobChan))
 		}
 
 		// bot.Forward populates the full message, but ensure Chat is set for Delete
@@ -659,6 +664,37 @@ func main() {
 			Results:   results,
 			CacheTime: 30,
 		})
+	})
+
+	// /status — progress report for admin (dev and prod)
+	bot.Handle("/status", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+
+		var totalMemes int
+		db.QueryRow("SELECT count(*) FROM memes").Scan(&totalMemes)
+
+		lastCrawled, _ := getCrawlerState(db, "last_crawled_msg_id")
+		if lastCrawled == "" {
+			lastCrawled = "0"
+		}
+
+		queueLen := len(jobChan)
+
+		env := "prod"
+		if cfg.DevMode {
+			env = "dev"
+		}
+
+		msg := fmt.Sprintf(
+			"📊 Статус memebot (%s)\n\n"+
+				"🗄 Проиндексировано мемов: %d\n"+
+				"🔍 Последний просмотренный msg_id: %s\n"+
+				"⏳ Очередь на обработку: %d",
+			env, totalMemes, lastCrawled, queueLen,
+		)
+		return c.Send(msg)
 	})
 
 	dumpChat := &tele.Chat{ID: cfg.DumpChatID}
