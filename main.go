@@ -25,7 +25,7 @@ import (
 
 type Config struct {
 	TelegramToken   string
-	GeminiAPIKey    string
+	ClaudeAPIKey    string
 	ChannelUsername string // e.g. "@mychannel"
 	DumpChatID      int64
 	AdminID         int64
@@ -61,7 +61,7 @@ func loadConfig() Config {
 
 	return Config{
 		TelegramToken:   must("TELEGRAM_TOKEN"),
-		GeminiAPIKey:    must("GEMINI_API_KEY"),
+		ClaudeAPIKey:    must("CLAUDE_API_KEY"),
 		ChannelUsername: must("CHANNEL_USERNAME"),
 		DumpChatID:      dumpChatID,
 		AdminID:         adminID,
@@ -230,34 +230,39 @@ func buildFTSQuery(query string) string {
 	return strings.Join(terms, " AND ")
 }
 
-// ─── Gemini Integration ───────────────────────────────────────────────────────
+// ─── Claude Integration ───────────────────────────────────────────────────────
 
-type geminiRequest struct {
-	Contents []geminiContent `json:"contents"`
+type claudeRequest struct {
+	Model     string          `json:"model"`
+	MaxTokens int             `json:"max_tokens"`
+	Messages  []claudeMessage `json:"messages"`
 }
 
-type geminiContent struct {
-	Parts []geminiPart `json:"parts"`
+type claudeMessage struct {
+	Role    string          `json:"role"`
+	Content []claudeContent `json:"content"`
 }
 
-type geminiPart struct {
-	Text       string           `json:"text,omitempty"`
-	InlineData *geminiInlineData `json:"inline_data,omitempty"`
+type claudeContent struct {
+	Type   string             `json:"type"`
+	Text   string             `json:"text,omitempty"`
+	Source *claudeImageSource `json:"source,omitempty"`
 }
 
-type geminiInlineData struct {
-	MimeType string `json:"mime_type"`
-	Data     string `json:"data"` // base64-encoded
+type claudeImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
-const geminiPrompt = `Проанализируй мем или комикс и ответь в двух частях:
+const claudePrompt = `Проанализируй мем или комикс и ответь в двух частях:
 1. Описание: что происходит на картинке (1-2 предложения на русском).
 2. Текст: перепиши дословно весь текст с картинки, сохраняя оригинальный язык и написание брендов, имён, мемных фраз. Если текста нет — напиши "Текст отсутствует".
 Формат ответа:
 Описание: ...
 Текст: ...`
 
-// describeImage fetches an image from Telegram by file_id and sends it to Gemini.
+// describeImage fetches an image from Telegram by file_id and sends it to Claude.
 func describeImage(cfg Config, fileID string) (string, error) {
 	// Step 1: resolve file_path via Telegram getFile
 	tgFileURL := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", cfg.TelegramToken, fileID)
@@ -294,7 +299,7 @@ func describeImage(cfg Config, fileID string) (string, error) {
 		return "", fmt.Errorf("read image: %w", err)
 	}
 
-	// Infer MIME type from extension
+	// Infer MIME type from extension (Claude supports jpeg, png, webp, gif)
 	mimeType := "image/jpeg"
 	switch {
 	case strings.HasSuffix(fileInfo.Result.FilePath, ".png"):
@@ -305,62 +310,77 @@ func describeImage(cfg Config, fileID string) (string, error) {
 		mimeType = "image/gif"
 	}
 
-	// Step 3: call Gemini REST API
-	geminiURL := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=%s",
-		cfg.GeminiAPIKey,
-	)
+	// Step 3: call Claude REST API
+	claudeURL := "https://api.anthropic.com/v1/messages"
 
-	reqBody := geminiRequest{
-		Contents: []geminiContent{{
-			Parts: []geminiPart{
-				{InlineData: &geminiInlineData{
-					MimeType: mimeType,
-					Data:     base64.StdEncoding.EncodeToString(imageBytes),
-				}},
-				{Text: geminiPrompt},
+	reqBody := claudeRequest{
+		Model:     "claude-haiku-4-5", // Haiku is fast, cheap and supports vision
+		MaxTokens: 1000,
+		Messages: []claudeMessage{
+			{
+				Role: "user",
+				Content: []claudeContent{
+					{
+						Type: "image",
+						Source: &claudeImageSource{
+							Type:      "base64",
+							MediaType: mimeType,
+							Data:      base64.StdEncoding.EncodeToString(imageBytes),
+						},
+					},
+					{
+						Type: "text",
+						Text: claudePrompt,
+					},
+				},
 			},
-		}},
+		},
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("marshal gemini request: %w", err)
+		return "", fmt.Errorf("marshal claude request: %w", err)
 	}
 
-	geminiResp, err := http.Post(geminiURL, "application/json", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", claudeURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", fmt.Errorf("gemini HTTP request: %w", err)
+		return "", fmt.Errorf("create claude request: %w", err)
 	}
-	defer geminiResp.Body.Close()
 
-	var geminiResult struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", cfg.ClaudeAPIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	claudeResp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("claude HTTP request: %w", err)
+	}
+	defer claudeResp.Body.Close()
+
+	var claudeResult struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
 		Error *struct {
+			Type    string `json:"type"`
 			Message string `json:"message"`
-			Code    int    `json:"code"`
 		} `json:"error"`
 	}
 
-	if err := json.NewDecoder(geminiResp.Body).Decode(&geminiResult); err != nil {
-		return "", fmt.Errorf("decode gemini response: %w", err)
+	if err := json.NewDecoder(claudeResp.Body).Decode(&claudeResult); err != nil {
+		return "", fmt.Errorf("decode claude response: %w", err)
 	}
 
-	if geminiResult.Error != nil {
-		return "", fmt.Errorf("gemini API error %d: %s", geminiResult.Error.Code, geminiResult.Error.Message)
+	if claudeResult.Error != nil {
+		return "", fmt.Errorf("claude API error [%s]: %s", claudeResult.Error.Type, claudeResult.Error.Message)
 	}
 
-	if len(geminiResult.Candidates) == 0 || len(geminiResult.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("empty gemini response for file_id=%s", fileID)
+	if len(claudeResult.Content) == 0 {
+		return "", fmt.Errorf("empty claude response for file_id=%s", fileID)
 	}
 
-	return strings.TrimSpace(geminiResult.Candidates[0].Content.Parts[0].Text), nil
+	return strings.TrimSpace(claudeResult.Content[0].Text), nil
 }
 
 // ─── Admin alerts ─────────────────────────────────────────────────────────────
@@ -381,13 +401,14 @@ type indexJob struct {
 	replyTo int64 // if > 0, send AI result back to this chat (admin DM)
 }
 
-// runWorker consumes jobs from jobChan, gated by a ticker to stay within
-// Gemini rate limits: 5 req/min → 1 req / 12 s.
+// runWorker consumes jobs from jobChan, gated by a ticker to stay within rate limits.
 func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
-	ticker := time.NewTicker(4500 * time.Millisecond)
+	// 2000 ms is a safe default for Claude paid tiers.
+	// If you hit rate limits, increase this to 4500 (like Gemini before).
+	ticker := time.NewTicker(2000 * time.Millisecond)
 	defer ticker.Stop()
 
-	log.Println("worker pool started (rate limit: 1 req / 4.5 s → 13 req/min)")
+	log.Println("worker pool started (rate limit: 1 req / 2 s)")
 
 	for job := range jobChan {
 		<-ticker.C // wait for the rate-limit window
@@ -407,11 +428,11 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
 
 		desc, err := describeImage(cfg, job.fileID)
 		if err != nil {
-			errMsg := fmt.Sprintf("Gemini failed for msg_id=%d file_id=%s: %v", job.msgID, job.fileID, err)
+			errMsg := fmt.Sprintf("Claude failed for msg_id=%d file_id=%s: %v", job.msgID, job.fileID, err)
 			sendAdminAlert(bot, cfg.AdminID, errMsg)
 			if job.replyTo > 0 {
 				chat := &tele.Chat{ID: job.replyTo}
-				bot.Send(chat, "❌ Ошибка Gemini: "+err.Error())
+				bot.Send(chat, "❌ Ошибка Claude: "+err.Error())
 			}
 			continue
 		}
