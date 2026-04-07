@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kljensen/snowball"
@@ -24,13 +26,18 @@ import (
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 type Config struct {
-	TelegramToken   string
-	ClaudeAPIKey    string
-	ChannelUsername string // e.g. "@mychannel"
-	DumpChatID      int64
-	AdminID         int64
-	DBPath          string
-	DevMode         bool // APP_ENV=dev
+	TelegramToken      string
+	AIProvider         string // "claude" | "gemini"
+	ClaudeAPIKey       string
+	GeminiAPIKey       string
+	GeminiWorkerURL    string // Cloudflare Worker URL (replaces direct googleapis.com call)
+	GeminiWorkerSecret string // X-Worker-Secret header value
+	ChannelUsername    string // e.g. "@mychannel"
+	DumpChatID         int64
+	AdminID            int64
+	DBPath             string
+	DevMode            bool // APP_ENV=dev
+	CrawlerMaxGap      int  // consecutive misses before history is considered exhausted
 }
 
 func loadConfig() Config {
@@ -59,14 +66,40 @@ func loadConfig() Config {
 
 	devMode := os.Getenv("APP_ENV") == "dev"
 
+	crawlerMaxGap := 100
+	if v := os.Getenv("CRAWLER_MAX_GAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			crawlerMaxGap = n
+		}
+	}
+
+	provider := os.Getenv("AI_PROVIDER")
+	if provider == "" {
+		provider = "claude"
+	}
+	var claudeKey, geminiKey string
+	switch provider {
+	case "claude":
+		claudeKey = must("CLAUDE_API_KEY")
+	case "gemini":
+		geminiKey = must("GEMINI_API_KEY")
+	default:
+		log.Fatalf("unknown AI_PROVIDER: %s (use 'claude' or 'gemini')", provider)
+	}
+
 	return Config{
-		TelegramToken:   must("TELEGRAM_TOKEN"),
-		ClaudeAPIKey:    must("CLAUDE_API_KEY"),
-		ChannelUsername: must("CHANNEL_USERNAME"),
-		DumpChatID:      dumpChatID,
-		AdminID:         adminID,
-		DBPath:          dbPath,
-		DevMode:         devMode,
+		TelegramToken:      must("TELEGRAM_TOKEN"),
+		AIProvider:         provider,
+		ClaudeAPIKey:       claudeKey,
+		GeminiAPIKey:       geminiKey,
+		GeminiWorkerURL:    os.Getenv("GEMINI_WORKER_URL"),
+		GeminiWorkerSecret: os.Getenv("GEMINI_WORKER_SECRET"),
+		ChannelUsername:    must("CHANNEL_USERNAME"),
+		DumpChatID:         dumpChatID,
+		AdminID:            adminID,
+		DBPath:             dbPath,
+		DevMode:            devMode,
+		CrawlerMaxGap:      crawlerMaxGap,
 	}
 }
 
@@ -148,7 +181,7 @@ func saveMeme(db *sql.DB, fileID string, msgID int, originalDesc string) error {
 
 func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
 	rows, err := db.Query(
-		`SELECT file_id, rowid FROM memes WHERE search_vector MATCH ? ORDER BY rank LIMIT 50`,
+		`SELECT file_id, rowid, original_desc FROM memes WHERE search_vector MATCH ? ORDER BY rank LIMIT 50`,
 		ftsQuery,
 	)
 	if err != nil {
@@ -158,14 +191,19 @@ func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
 
 	results := make([]tele.Result, 0)
 	for rows.Next() {
-		var fileID string
+		var fileID, originalDesc string
 		var rowid int64
-		if err := rows.Scan(&fileID, &rowid); err != nil {
+		if err := rows.Scan(&fileID, &rowid, &originalDesc); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		// Telegram caption limit is 1024 characters
+		if len(originalDesc) > 1024 {
+			originalDesc = originalDesc[:1021] + "..."
 		}
 		results = append(results, &tele.PhotoResult{
 			ResultBase: tele.ResultBase{ID: strconv.FormatInt(rowid, 10)},
 			Cache:      fileID,
+			Caption:    originalDesc,
 		})
 	}
 
@@ -206,7 +244,15 @@ func stemWord(word string) string {
 }
 
 // buildSearchVector produces a stemmed, punctuation-free string for FTS5 indexing.
+// Section labels from the AI response ("Описание:", "Текст:", "Персоны:") are stripped
+// so they don't match every search query.
 func buildSearchVector(text string) string {
+	text = strings.NewReplacer(
+		"Описание:", "",
+		"Текст:", "",
+		"Персоны:", "",
+		"Текст отсутствует", "",
+	).Replace(text)
 	text = strings.ToLower(stripPunct(text))
 	words := strings.Fields(text)
 	for i, w := range words {
@@ -230,45 +276,31 @@ func buildFTSQuery(query string) string {
 	return strings.Join(terms, " AND ")
 }
 
-// ─── Claude Integration ───────────────────────────────────────────────────────
+// ─── AI Integration ───────────────────────────────────────────────────────────
 
-type claudeRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	Messages  []claudeMessage `json:"messages"`
-}
+const aiPrompt = `Проанализируй мем или комикс и ответь в трёх частях:
 
-type claudeMessage struct {
-	Role    string          `json:"role"`
-	Content []claudeContent `json:"content"`
-}
+1. Описание: что происходит на картинке (1-2 предложения на русском). Если на изображении есть узнаваемые люди — назови их (например: "Илон Маск", "Путин", "Киану Ривз").
 
-type claudeContent struct {
-	Type   string             `json:"type"`
-	Text   string             `json:"text,omitempty"`
-	Source *claudeImageSource `json:"source,omitempty"`
-}
+2. Текст: перепиши дословно весь текст с картинки, сохраняя оригинальный язык и написание. Правила:
+   - Названия игр, фильмов, брендов и прочего пиши в оригинальном виде рядом с русской версией, например: "дарк соулс (Dark Souls)", "скайрим (Skyrim)", "майкрософт (Microsoft)".
+   - Если в тексте есть намеренно или случайно искажённые слова (опечатки, просторечие, мемные написания), перепиши их как есть, а рядом в скобках укажи правильное написание, например: "коникулы (каникулы)", "ничиво (ничего)", "превет (привет)".
+   - Если текста нет — напиши "Текст отсутствует".
 
-type claudeImageSource struct {
-	Type      string `json:"type"`
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
-}
+3. Персоны: перечисли через запятую всех узнаваемых людей на изображении. Если никого нет — напиши "Нет".
 
-const claudePrompt = `Проанализируй мем или комикс и ответь в двух частях:
-1. Описание: что происходит на картинке (1-2 предложения на русском).
-2. Текст: перепиши дословно весь текст с картинки, сохраняя оригинальный язык и написание брендов, имён, мемных фраз. Если текста нет — напиши "Текст отсутствует".
 Формат ответа:
 Описание: ...
-Текст: ...`
+Текст: ...
+Персоны: ...`
 
-// describeImage fetches an image from Telegram by file_id and sends it to Claude.
-func describeImage(cfg Config, fileID string) (string, error) {
-	// Step 1: resolve file_path via Telegram getFile
+// fetchImageBytes resolves a Telegram file_id to raw image bytes and MIME type.
+func fetchImageBytes(cfg Config, fileID string) ([]byte, string, error) {
 	tgFileURL := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", cfg.TelegramToken, fileID)
-	resp, err := http.Get(tgFileURL)
+	tgClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := tgClient.Get(tgFileURL)
 	if err != nil {
-		return "", fmt.Errorf("getFile request: %w", err)
+		return nil, "", fmt.Errorf("getFile request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -280,26 +312,24 @@ func describeImage(cfg Config, fileID string) (string, error) {
 		Description string `json:"description"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
-		return "", fmt.Errorf("decode getFile: %w", err)
+		return nil, "", fmt.Errorf("decode getFile: %w", err)
 	}
 	if !fileInfo.OK {
-		return "", fmt.Errorf("getFile failed: %s", fileInfo.Description)
+		return nil, "", fmt.Errorf("getFile failed: %s", fileInfo.Description)
 	}
 
-	// Step 2: download image bytes
 	imageURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", cfg.TelegramToken, fileInfo.Result.FilePath)
-	imgResp, err := http.Get(imageURL)
+	imgResp, err := (&http.Client{Timeout: 60 * time.Second}).Get(imageURL)
 	if err != nil {
-		return "", fmt.Errorf("download image: %w", err)
+		return nil, "", fmt.Errorf("download image: %w", err)
 	}
 	defer imgResp.Body.Close()
 
 	imageBytes, err := io.ReadAll(imgResp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read image: %w", err)
+		return nil, "", fmt.Errorf("read image: %w", err)
 	}
 
-	// Infer MIME type from extension (Claude supports jpeg, png, webp, gif)
 	mimeType := "image/jpeg"
 	switch {
 	case strings.HasSuffix(fileInfo.Result.FilePath, ".png"):
@@ -310,31 +340,39 @@ func describeImage(cfg Config, fileID string) (string, error) {
 		mimeType = "image/gif"
 	}
 
-	// Step 3: call Claude REST API
-	claudeURL := "https://api.anthropic.com/v1/messages"
+	return imageBytes, mimeType, nil
+}
 
-	reqBody := claudeRequest{
-		Model:     "claude-haiku-4-5-20251001", // Haiku is fast, cheap and supports vision
+// callClaude sends imageBytes to the Claude vision API and returns the description.
+func callClaude(apiKey string, imageBytes []byte, mimeType string) (string, error) {
+	type imageSource struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+	}
+	type content struct {
+		Type   string       `json:"type"`
+		Text   string       `json:"text,omitempty"`
+		Source *imageSource `json:"source,omitempty"`
+	}
+	type message struct {
+		Role    string    `json:"role"`
+		Content []content `json:"content"`
+	}
+	reqBody := struct {
+		Model     string    `json:"model"`
+		MaxTokens int       `json:"max_tokens"`
+		Messages  []message `json:"messages"`
+	}{
+		Model:     "claude-haiku-4-5-20251001",
 		MaxTokens: 1000,
-		Messages: []claudeMessage{
-			{
-				Role: "user",
-				Content: []claudeContent{
-					{
-						Type: "image",
-						Source: &claudeImageSource{
-							Type:      "base64",
-							MediaType: mimeType,
-							Data:      base64.StdEncoding.EncodeToString(imageBytes),
-						},
-					},
-					{
-						Type: "text",
-						Text: claudePrompt,
-					},
-				},
+		Messages: []message{{
+			Role: "user",
+			Content: []content{
+				{Type: "image", Source: &imageSource{Type: "base64", MediaType: mimeType, Data: base64.StdEncoding.EncodeToString(imageBytes)}},
+				{Type: "text", Text: aiPrompt},
 			},
-		},
+		}},
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
@@ -342,23 +380,21 @@ func describeImage(cfg Config, fileID string) (string, error) {
 		return "", fmt.Errorf("marshal claude request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", claudeURL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", fmt.Errorf("create claude request: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", cfg.ClaudeAPIKey)
+	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	claudeResp, err := client.Do(req)
+	claudeResp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("claude HTTP request: %w", err)
 	}
 	defer claudeResp.Body.Close()
 
-	var claudeResult struct {
+	var result struct {
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
@@ -367,20 +403,96 @@ func describeImage(cfg Config, fileID string) (string, error) {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-
-	if err := json.NewDecoder(claudeResp.Body).Decode(&claudeResult); err != nil {
+	if err := json.NewDecoder(claudeResp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("decode claude response: %w", err)
 	}
+	if result.Error != nil {
+		return "", fmt.Errorf("claude API error [%s]: %s", result.Error.Type, result.Error.Message)
+	}
+	if len(result.Content) == 0 {
+		return "", fmt.Errorf("empty claude response")
+	}
+	return strings.TrimSpace(result.Content[0].Text), nil
+}
 
-	if claudeResult.Error != nil {
-		return "", fmt.Errorf("claude API error [%s]: %s", claudeResult.Error.Type, claudeResult.Error.Message)
+// callGemini sends imageBytes to the Gemini vision API and returns the description.
+// workerURL overrides the googleapis.com base URL (Cloudflare Worker); empty means direct.
+// workerSecret is sent as X-Worker-Secret if set.
+func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeType string) (string, error) {
+	reqBody := struct {
+		Contents []struct {
+			Parts []any `json:"parts"`
+		} `json:"contents"`
+	}{
+		Contents: []struct {
+			Parts []any `json:"parts"`
+		}{{
+			Parts: []any{
+				map[string]any{"inline_data": map[string]string{"mime_type": mimeType, "data": base64.StdEncoding.EncodeToString(imageBytes)}},
+				map[string]string{"text": aiPrompt},
+			},
+		}},
 	}
 
-	if len(claudeResult.Content) == 0 {
-		return "", fmt.Errorf("empty claude response for file_id=%s", fileID)
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal gemini request: %w", err)
 	}
 
-	return strings.TrimSpace(claudeResult.Content[0].Text), nil
+	base := "https://generativelanguage.googleapis.com"
+	if workerURL != "" {
+		base = workerURL
+	}
+	endpoint := base + "/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=" + apiKey
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("create gemini request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if workerSecret != "" {
+		req.Header.Set("X-Worker-Secret", workerSecret)
+	}
+
+	geminiResp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gemini HTTP request: %w", err)
+	}
+	defer geminiResp.Body.Close()
+
+	var result struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(geminiResp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode gemini response: %w", err)
+	}
+	if result.Error != nil {
+		return "", fmt.Errorf("gemini API error: %s", result.Error.Message)
+	}
+	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("empty gemini response")
+	}
+	return strings.TrimSpace(result.Candidates[0].Content.Parts[0].Text), nil
+}
+
+// describeImage fetches an image from Telegram and sends it to the configured AI provider.
+func describeImage(cfg Config, fileID string) (string, error) {
+	imageBytes, mimeType, err := fetchImageBytes(cfg, fileID)
+	if err != nil {
+		return "", err
+	}
+	if cfg.AIProvider == "gemini" {
+		return callGemini(cfg.GeminiAPIKey, cfg.GeminiWorkerURL, cfg.GeminiWorkerSecret, imageBytes, mimeType)
+	}
+	return callClaude(cfg.ClaudeAPIKey, imageBytes, mimeType)
 }
 
 // ─── Admin alerts ─────────────────────────────────────────────────────────────
@@ -399,10 +511,11 @@ type indexJob struct {
 	fileID  string
 	msgID   int
 	replyTo int64 // if > 0, send AI result back to this chat (admin DM)
+	retries int   // number of AI retry attempts so far
 }
 
 // runWorker consumes jobs from jobChan, gated by a ticker to stay within rate limits.
-func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
+func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob) {
 	// 2000 ms is a safe default for Claude paid tiers.
 	// If you hit rate limits, increase this to 4500 (like Gemini before).
 	ticker := time.NewTicker(2000 * time.Millisecond)
@@ -428,11 +541,22 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan <-chan indexJob) {
 
 		desc, err := describeImage(cfg, job.fileID)
 		if err != nil {
-			errMsg := fmt.Sprintf("Claude failed for msg_id=%d file_id=%s: %v", job.msgID, job.fileID, err)
-			sendAdminAlert(bot, cfg.AdminID, errMsg)
-			if job.replyTo > 0 {
-				chat := &tele.Chat{ID: job.replyTo}
-				bot.Send(chat, "❌ Ошибка Claude: "+err.Error())
+			const maxRetries = 3
+			if job.replyTo == 0 && job.retries < maxRetries {
+				job.retries++
+				delay := time.Duration(job.retries*30) * time.Second
+				log.Printf("worker: AI error msg_id=%d, retry %d/%d in %s: %v", job.msgID, job.retries, maxRetries, delay, err)
+				go func(j indexJob) {
+					time.Sleep(delay)
+					jobChan <- j
+				}(job)
+			} else {
+				errMsg := fmt.Sprintf("AI failed for msg_id=%d file_id=%s (retries=%d): %v", job.msgID, job.fileID, job.retries, err)
+				sendAdminAlert(bot, cfg.AdminID, errMsg)
+				if job.replyTo > 0 {
+					chat := &tele.Chat{ID: job.replyTo}
+					bot.Send(chat, "❌ Ошибка AI: "+err.Error())
+				}
 			}
 			continue
 		}
@@ -482,20 +606,28 @@ func (m channelMsg) MessageSig() (string, int64) {
 // crawlHistory iterates message IDs from 1 upward, forwarding each post to the
 // dump chat to obtain its file_id. It resumes from where it left off on restart.
 // photoLimit > 0 stops after that many photos are enqueued (dev mode).
-func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpChat *tele.Chat, jobChan chan<- indexJob, photoLimit int) {
+// ctx cancellation stops the crawler gracefully.
+func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpChat *tele.Chat, jobChan chan indexJob, photoLimit int) {
 	lastStr, err := getCrawlerState(db, "last_crawled_msg_id")
 	if err != nil {
 		log.Printf("crawler: cannot read state: %v", err)
 		lastStr = "0"
 	}
 	startID, _ := strconv.Atoi(lastStr)
-	log.Printf("crawler: starting from msg_id=%d (photoLimit=%d)", startID+1, photoLimit)
+	log.Printf("crawler: starting from msg_id=%d (photoLimit=%d, maxGap=%d)", startID+1, photoLimit, cfg.CrawlerMaxGap)
 
-	const maxGap = 100 // consecutive misses before we consider history exhausted
 	consecutiveMisses := 0
 	photosEnqueued := 0
 
 	for msgID := startID + 1; ; msgID++ {
+		// Check for external stop signal
+		select {
+		case <-ctx.Done():
+			log.Println("crawler: stopped by request")
+			return
+		default:
+		}
+
 		if photoLimit > 0 && photosEnqueued >= photoLimit {
 			log.Printf("crawler: dev limit reached (%d photos), stopping", photoLimit)
 			break
@@ -505,9 +637,18 @@ func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpCh
 
 		copied, err := bot.Forward(dumpChat, channelMsg{id: msgID, chatID: channelID})
 		if err != nil {
+			errStr := err.Error()
+			// Rate limit or transient network error — pause and retry same msgID
+			if strings.Contains(errStr, "retry") || strings.Contains(errStr, "Too Many") || strings.Contains(errStr, "timeout") {
+				log.Printf("crawler: transient error at msg_id=%d, pausing 10s: %v", msgID, err)
+				time.Sleep(10 * time.Second)
+				msgID-- // retry same ID
+				continue
+			}
+			// Message doesn't exist — count as a miss
 			consecutiveMisses++
-			if consecutiveMisses >= maxGap {
-				log.Printf("crawler: %d consecutive misses at msg_id=%d — history exhausted", maxGap, msgID)
+			if consecutiveMisses >= cfg.CrawlerMaxGap {
+				log.Printf("crawler: %d consecutive misses at msg_id=%d — history exhausted", cfg.CrawlerMaxGap, msgID)
 				break
 			}
 			continue
@@ -555,7 +696,7 @@ func crawlHistory(bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpCh
 // resolveChannelID calls getChat to obtain the numeric ID for a channel username.
 func resolveChannelID(token, username string) (int64, error) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getChat?chat_id=%s", token, username)
-	resp, err := http.Get(url)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(url)
 	if err != nil {
 		return 0, fmt.Errorf("getChat request: %w", err)
 	}
@@ -604,6 +745,22 @@ func main() {
 
 	jobChan := make(chan indexJob, 1000)
 	go runWorker(bot, db, cfg, jobChan)
+
+	var crawlerRunning atomic.Bool
+	crawlerCtx, crawlerCancel := context.WithCancel(context.Background())
+
+	startCrawler := func(photoLimit int) {
+		if crawlerRunning.Swap(true) {
+			log.Println("crawler: already running, skipping start")
+			return
+		}
+		go func() {
+			defer crawlerRunning.Store(false)
+			dumpChat := &tele.Chat{ID: cfg.DumpChatID}
+			crawlHistory(crawlerCtx, bot, db, cfg, channelID, dumpChat, jobChan, photoLimit)
+		}()
+	}
+	_ = crawlerCancel // used inside /reset handler closure
 
 	// Listen for new photos posted to the channel
 	channelUsernamePlain := strings.TrimPrefix(cfg.ChannelUsername, "@")
@@ -697,7 +854,49 @@ func main() {
 		return c.Send(msg)
 	})
 
-	dumpChat := &tele.Chat{ID: cfg.DumpChatID}
+	// /resume — continue crawling from last saved msg_id without resetting DB (dev and prod)
+	bot.Handle("/resume", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		if crawlerRunning.Load() {
+			return c.Send("⚠️ Краулер уже запущен.")
+		}
+		lastCrawled, _ := getCrawlerState(db, "last_crawled_msg_id")
+		if lastCrawled == "" {
+			lastCrawled = "0"
+		}
+		startCrawler(0)
+		return c.Send(fmt.Sprintf("▶️ Продолжаю индексацию с msg_id=%s...", lastCrawled))
+	})
+
+	// /reset — resets DB and restarts crawler (dev and prod)
+	bot.Handle("/reset", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		// Stop current crawler if running
+		if crawlerRunning.Load() {
+			crawlerCancel()
+			time.Sleep(500 * time.Millisecond)
+			crawlerCtx, crawlerCancel = context.WithCancel(context.Background())
+		}
+		if err := resetDB(db); err != nil {
+			return c.Send("❌ Ошибка сброса БД: " + err.Error())
+		}
+		if cfg.DevMode {
+			n := 10
+			if arg := c.Message().Payload; arg != "" {
+				if parsed, err := strconv.Atoi(arg); err == nil && parsed > 0 {
+					n = parsed
+				}
+			}
+			startCrawler(n)
+			return c.Send(fmt.Sprintf("🔄 БД сброшена. Запускаю индексацию %d фото...", n))
+		}
+		startCrawler(0)
+		return c.Send("🔄 БД сброшена. Краулер запущен с начала канала.")
+	})
 
 	if cfg.DevMode {
 		// In dev mode crawling only starts on /index <n> command from admin
@@ -705,30 +904,25 @@ func main() {
 			if c.Chat().ID != cfg.AdminID {
 				return nil
 			}
-
 			n := 10
 			if arg := c.Message().Payload; arg != "" {
 				if parsed, err := strconv.Atoi(arg); err == nil && parsed > 0 {
 					n = parsed
 				}
 			}
-
 			log.Printf("admin: /index %d — resetting DB and starting crawl", n)
 			if err := resetDB(db); err != nil {
 				return c.Send("❌ Ошибка сброса БД: " + err.Error())
 			}
-
 			if err := c.Send(fmt.Sprintf("🔄 Запускаю индексацию %d фото с начала канала...", n)); err != nil {
 				log.Printf("admin: send failed: %v", err)
 			}
-
-			go crawlHistory(bot, db, cfg, channelID, dumpChat, jobChan, n)
+			startCrawler(n)
 			return nil
 		})
-
 		log.Println("DEV MODE: crawler on hold — send /index <n> to start")
 	} else {
-		go crawlHistory(bot, db, cfg, channelID, dumpChat, jobChan, 0)
+		startCrawler(0)
 	}
 
 	log.Println("memebot running")

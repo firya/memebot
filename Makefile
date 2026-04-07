@@ -29,7 +29,7 @@ help: ## Показать это сообщение
 	@echo ""
 
 up: ## Собрать и запустить в фоне
-	docker compose up --build -d
+	docker compose up --build -dДавай
 	@echo ""
 	@echo "  Запущен. Логи: $(CYAN)make logs$(RESET)"
 
