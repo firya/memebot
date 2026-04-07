@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -230,6 +231,10 @@ func setCrawlerState(db *sql.DB, key, value string) error {
 // ─── NLP: Stemming & FTS query ────────────────────────────────────────────────
 
 var punctRe = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
+
+// errQuotaExceeded is returned by callGemini when the daily API quota is exhausted.
+// The worker must not retry such requests — the quota resets at midnight UTC.
+var errQuotaExceeded = errors.New("gemini daily quota exceeded")
 
 func stripPunct(text string) string {
 	return punctRe.ReplaceAllString(text, " ")
@@ -475,7 +480,14 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 		return "", fmt.Errorf("decode gemini response: %w", err)
 	}
 	if result.Error != nil {
-		return "", fmt.Errorf("gemini API error: %s", result.Error.Message)
+		msg := result.Error.Message
+		if geminiResp.StatusCode == 429 || strings.Contains(strings.ToLower(msg), "quota") || strings.Contains(msg, "RESOURCE_EXHAUSTED") {
+			return "", errQuotaExceeded
+		}
+		return "", fmt.Errorf("gemini API error: %s", msg)
+	}
+	if geminiResp.StatusCode == 429 {
+		return "", errQuotaExceeded
 	}
 	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("empty gemini response")
@@ -541,6 +553,23 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob) {
 
 		desc, err := describeImage(cfg, job.fileID)
 		if err != nil {
+			if errors.Is(err, errQuotaExceeded) {
+				// Daily quota exhausted — pause until next midnight UTC, then requeue.
+				now := time.Now().UTC()
+				nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, time.UTC)
+				waitDur := time.Until(nextMidnight)
+				alertMsg := fmt.Sprintf("Gemini daily quota (500 req) exhausted. Worker paused until %s UTC (~%s)", nextMidnight.Format("2006-01-02 15:04"), waitDur.Round(time.Minute))
+				log.Println("worker:", alertMsg)
+				sendAdminAlert(bot, cfg.AdminID, alertMsg)
+				// Requeue the current job to run after reset, then sleep.
+				go func(j indexJob) {
+					time.Sleep(waitDur)
+					jobChan <- j
+				}(job)
+				time.Sleep(waitDur)
+				log.Println("worker: quota reset window reached, resuming")
+				continue
+			}
 			const maxRetries = 3
 			if job.replyTo == 0 && job.retries < maxRetries {
 				job.retries++
@@ -852,6 +881,19 @@ func main() {
 			env, totalMemes, lastCrawled, queueLen,
 		)
 		return c.Send(msg)
+	})
+
+	// /stop — stop crawler without resetting DB (dev and prod)
+	bot.Handle("/stop", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		if !crawlerRunning.Load() {
+			return c.Send("ℹ️ Краулер не запущен.")
+		}
+		crawlerCancel()
+		crawlerCtx, crawlerCancel = context.WithCancel(context.Background())
+		return c.Send("⏹ Индексирование остановлено. Прогресс сохранён, возобновить: /resume")
 	})
 
 	// /resume — continue crawling from last saved msg_id without resetting DB (dev and prod)
