@@ -8,8 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
+	"math/bits"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -133,6 +138,10 @@ func initDB(path string) (*sql.DB, error) {
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS image_hashes (
+		phash INTEGER NOT NULL
+	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -147,6 +156,7 @@ func resetDB(db *sql.DB) error {
 		DELETE FROM memes;
 		DELETE FROM indexed_msgs;
 		DELETE FROM crawler_state;
+		DELETE FROM image_hashes;
 	`)
 	return err
 }
@@ -178,6 +188,77 @@ func saveMeme(db *sql.DB, fileID string, msgID int, originalDesc string) error {
 	}
 
 	return tx.Commit()
+}
+
+// dHashThreshold is the max Hamming distance (out of 64) to treat two images
+// as duplicates. 8 catches recompressed / resized copies; raise to allow
+// more variation, lower for stricter matching.
+const dHashThreshold = 8
+
+// computeDHash returns a 64-bit difference hash for the image.
+// Returns 0 for unsupported or undecodable formats — callers must skip dedup when hash == 0.
+func computeDHash(imgBytes []byte) uint64 {
+	img, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return 0
+	}
+	const cols, rows = 9, 8
+	bounds := img.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+
+	// Sample a cols×rows grid using nearest-neighbour and convert to grayscale.
+	var grid [rows][cols]uint8
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols; x++ {
+			sx := bounds.Min.X + x*srcW/cols
+			sy := bounds.Min.Y + y*srcH/rows
+			r, g, b, _ := img.At(sx, sy).RGBA()
+			grid[y][x] = color.Gray{Y: uint8((19595*r + 38470*g + 7471*b + 1<<15) >> 24)}.Y
+		}
+	}
+
+	// Each bit: 1 if left pixel is brighter than right neighbour.
+	var hash uint64
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols-1; x++ {
+			if grid[y][x] > grid[y][x+1] {
+				hash |= 1 << uint(y*(cols-1)+x)
+			}
+		}
+	}
+	return hash
+}
+
+// isDuplicateImage returns true when an image with a Hamming distance ≤ dHashThreshold
+// already exists in image_hashes.
+func isDuplicateImage(db *sql.DB, hash uint64) (bool, error) {
+	if hash == 0 {
+		return false, nil
+	}
+	rows, err := db.Query("SELECT phash FROM image_hashes")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var stored uint64
+		if err := rows.Scan(&stored); err != nil {
+			return false, err
+		}
+		if bits.OnesCount64(hash^stored) <= dHashThreshold {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// storeImageHash saves a perceptual hash so future duplicates are detected.
+func storeImageHash(db *sql.DB, hash uint64) error {
+	if hash == 0 {
+		return nil
+	}
+	_, err := db.Exec("INSERT INTO image_hashes(phash) VALUES (?)", hash)
+	return err
 }
 
 func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
@@ -495,12 +576,8 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 	return strings.TrimSpace(result.Candidates[0].Content.Parts[0].Text), nil
 }
 
-// describeImage fetches an image from Telegram and sends it to the configured AI provider.
-func describeImage(cfg Config, fileID string) (string, error) {
-	imageBytes, mimeType, err := fetchImageBytes(cfg, fileID)
-	if err != nil {
-		return "", err
-	}
+// describeImageFromBytes sends pre-fetched image bytes to the configured AI provider.
+func describeImageFromBytes(cfg Config, imageBytes []byte, mimeType string) (string, error) {
 	if cfg.AIProvider == "gemini" {
 		return callGemini(cfg.GeminiAPIKey, cfg.GeminiWorkerURL, cfg.GeminiWorkerSecret, imageBytes, mimeType)
 	}
@@ -551,7 +628,32 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob) {
 
 		log.Printf("worker: describing msg_id=%d file_id=%s", job.msgID, job.fileID)
 
-		desc, err := describeImage(cfg, job.fileID)
+		imageBytes, mimeType, err := fetchImageBytes(cfg, job.fileID)
+		if err != nil {
+			log.Printf("worker: fetch error msg_id=%d: %v", job.msgID, err)
+			continue
+		}
+
+		// Perceptual dedup: skip images that look identical to already-indexed ones.
+		if job.replyTo == 0 {
+			hash := computeDHash(imageBytes)
+			dup, err := isDuplicateImage(db, hash)
+			if err != nil {
+				log.Printf("worker: phash check error msg_id=%d: %v", job.msgID, err)
+			} else if dup {
+				log.Printf("worker: msg_id=%d is a visual duplicate, skipping", job.msgID)
+				// Mark as indexed so the crawler doesn't revisit it.
+				if err := storeImageHash(db, hash); err != nil {
+					log.Printf("worker: store dup hash error msg_id=%d: %v", job.msgID, err)
+				}
+				if _, err := db.Exec("INSERT OR IGNORE INTO indexed_msgs(msg_id) VALUES (?)", job.msgID); err != nil {
+					log.Printf("worker: mark dup indexed error msg_id=%d: %v", job.msgID, err)
+				}
+				continue
+			}
+		}
+
+		desc, err := describeImageFromBytes(cfg, imageBytes, mimeType)
 		if err != nil {
 			if errors.Is(err, errQuotaExceeded) {
 				// Daily quota exhausted — pause until next midnight UTC, then requeue.
@@ -596,6 +698,13 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob) {
 				"DB save failed for msg_id=%d: %v", job.msgID, err,
 			))
 			continue
+		}
+
+		// Store perceptual hash so future duplicates are detected.
+		if job.replyTo == 0 {
+			if err := storeImageHash(db, computeDHash(imageBytes)); err != nil {
+				log.Printf("worker: store phash error msg_id=%d: %v", job.msgID, err)
+			}
 		}
 
 		preview := desc
