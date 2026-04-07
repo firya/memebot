@@ -923,6 +923,10 @@ func main() {
 			time.Sleep(500 * time.Millisecond)
 			crawlerCtx, crawlerCancel = context.WithCancel(context.Background())
 		}
+		// Drain jobs left in the queue from the previous crawl.
+		for len(jobChan) > 0 {
+			<-jobChan
+		}
 		if err := resetDB(db); err != nil {
 			return c.Send("❌ Ошибка сброса БД: " + err.Error())
 		}
