@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/kljensen/snowball"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	tele "gopkg.in/telebot.v3"
 )
 
@@ -111,7 +111,7 @@ func initDB(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
