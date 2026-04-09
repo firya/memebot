@@ -313,10 +313,6 @@ func setCrawlerState(db *sql.DB, key, value string) error {
 
 var punctRe = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
 
-// geminiLimitRe extracts the numeric limit from Gemini error messages like "limit: 15".
-// Per-minute limits are small (< 100); daily limits are large (≥ 100).
-var geminiLimitRe = regexp.MustCompile(`limit:\s*(\d+)`)
-
 // errQuotaExceeded is returned by callGemini when the daily API quota is exhausted.
 // The worker must not retry such requests — the quota resets at midnight UTC.
 var errQuotaExceeded = errors.New("gemini daily quota exceeded")
@@ -566,24 +562,30 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 		} `json:"error"`
 	}
 	if err := json.NewDecoder(geminiResp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode gemini response: %w", err)
+		// Body unreadable — fall back to HTTP status code.
+		if geminiResp.StatusCode == 429 {
+			if geminiResp.Header.Get("Retry-After") != "" {
+				return "", errRateLimited
+			}
+			return "", errQuotaExceeded
+		}
+		return "", fmt.Errorf("decode gemini response (status %d): %w", geminiResp.StatusCode, err)
 	}
 	if result.Error != nil {
 		msg := result.Error.Message
 		msgLower := strings.ToLower(msg)
 		if geminiResp.StatusCode == 429 || strings.Contains(msgLower, "quota") || strings.Contains(msg, "RESOURCE_EXHAUSTED") {
-			// Parse "limit: N" from the message: small limits (< 100) are per-minute, large ones are daily.
-			if m := geminiLimitRe.FindStringSubmatch(msg); m != nil {
-				if n, err := strconv.Atoi(m[1]); err == nil && n < 100 {
-					return "", errRateLimited
-				}
+			log.Printf("gemini quota/rate error (status=%d, retry-after=%q): %s", geminiResp.StatusCode, geminiResp.Header.Get("Retry-After"), msg)
+			// Retry-After present → per-minute RPM limit; absent → daily quota exhausted.
+			if geminiResp.Header.Get("Retry-After") != "" {
+				return "", errRateLimited
 			}
 			return "", errQuotaExceeded
 		}
 		return "", fmt.Errorf("gemini API error: %s", msg)
 	}
 	if geminiResp.StatusCode == 429 {
-		// No error body — use Retry-After header as signal of RPM limit; otherwise assume daily quota.
+		log.Printf("gemini 429 no-body (retry-after=%q)", geminiResp.Header.Get("Retry-After"))
 		if geminiResp.Header.Get("Retry-After") != "" {
 			return "", errRateLimited
 		}
@@ -624,7 +626,9 @@ type indexJob struct {
 
 // runWorker consumes jobs from jobChan, gated by a ticker to stay within rate limits.
 // wake is a buffered channel; sending to it interrupts any rate-limit sleep early.
-func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}) {
+// quotaUntil is set to the Unix timestamp of the planned wakeup while the worker
+// sleeps due to daily quota exhaustion, and reset to 0 when it resumes.
+func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}, quotaUntil *atomic.Int64) {
 	// 2000 ms is a safe default for Claude paid tiers.
 	// If you hit rate limits, increase this to 4500 (like Gemini before).
 	ticker := time.NewTicker(2000 * time.Millisecond)
@@ -696,12 +700,14 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 				log.Println("worker:", alertMsg)
 				sendAdminAlert(bot, cfg.AdminID, alertMsg)
 				jobChan <- job // requeue before sleeping
+				quotaUntil.Store(nextMidnight.Unix())
 				select {
 				case <-time.After(waitDur):
 					log.Println("worker: quota reset window reached, resuming")
 				case <-wake:
 					log.Println("worker: woken by /analyze, retrying immediately")
 				}
+				quotaUntil.Store(0)
 				continue
 			}
 			const maxRetries = 3
@@ -903,7 +909,7 @@ func resolveChannelID(token, username string) (int64, error) {
 
 // ─── Status helpers ───────────────────────────────────────────────────────────
 
-func buildStatusMsg(db *sql.DB, jobChan chan indexJob, devMode bool) string {
+func buildStatusMsg(db *sql.DB, jobChan chan indexJob, devMode bool, quotaUntil *atomic.Int64) string {
 	var totalMemes int
 	db.QueryRow("SELECT count(*) FROM memes").Scan(&totalMemes)
 
@@ -921,7 +927,7 @@ func buildStatusMsg(db *sql.DB, jobChan chan indexJob, devMode bool) string {
 		env = "dev"
 	}
 
-	return fmt.Sprintf(
+	msg := fmt.Sprintf(
 		"📊 Статус memebot (%s)\n\n"+
 			"🗄 Проиндексировано мемов: %d\n"+
 			"🔍 Последний просмотренный msg_id: %s\n"+
@@ -929,6 +935,11 @@ func buildStatusMsg(db *sql.DB, jobChan chan indexJob, devMode bool) string {
 			"⏳ Очередь на обработку: %d",
 		env, totalMemes, lastCrawled, lastWorker, len(jobChan),
 	)
+	if until := quotaUntil.Load(); until != 0 {
+		wakeTime := time.Unix(until, 0).UTC()
+		msg += fmt.Sprintf("\n💤 Квота Gemini исчерпана, worker спит до %s UTC", wakeTime.Format("2006-01-02 15:04"))
+	}
+	return msg
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -958,12 +969,14 @@ func main() {
 
 	jobChan := make(chan indexJob, 1000)
 	workerWake := make(chan struct{}, 1)
-	go runWorker(bot, db, cfg, jobChan, workerWake)
+	var workerQuotaUntil atomic.Int64
+	go runWorker(bot, db, cfg, jobChan, workerWake, &workerQuotaUntil)
 
 	var crawlerRunning atomic.Bool
 
 	// Periodic status reporter: sends /status to admin every 5 minutes while
 	// the crawler is running or there are jobs waiting in the queue.
+	// Suppressed while the worker is sleeping due to daily quota exhaustion.
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -972,7 +985,10 @@ func main() {
 			if !crawlerRunning.Load() && len(jobChan) == 0 {
 				continue
 			}
-			if _, err := bot.Send(admin, buildStatusMsg(db, jobChan, cfg.DevMode)); err != nil {
+			if workerQuotaUntil.Load() != 0 {
+				continue // worker is in quota sleep; no point spamming unchanged status
+			}
+			if _, err := bot.Send(admin, buildStatusMsg(db, jobChan, cfg.DevMode, &workerQuotaUntil)); err != nil {
 				log.Printf("status ticker: send failed: %v", err)
 			}
 		}
@@ -1058,7 +1074,7 @@ func main() {
 		if c.Chat().ID != cfg.AdminID {
 			return nil
 		}
-		return c.Send(buildStatusMsg(db, jobChan, cfg.DevMode))
+		return c.Send(buildStatusMsg(db, jobChan, cfg.DevMode, &workerQuotaUntil))
 	})
 
 	// /help — command reference for the admin
