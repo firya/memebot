@@ -692,7 +692,7 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 				now := time.Now().UTC()
 				nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, time.UTC)
 				waitDur := time.Until(nextMidnight)
-				alertMsg := fmt.Sprintf("Gemini daily quota exhausted. Worker paused until %s UTC (~%s). Разбудить: /analyze", nextMidnight.Format("2006-01-02 15:04"), waitDur.Round(time.Minute))
+				alertMsg := fmt.Sprintf("Gemini daily quota exhausted. Worker paused until %s UTC (~%s). Квота сбросится автоматически.", nextMidnight.Format("2006-01-02 15:04"), waitDur.Round(time.Minute))
 				log.Println("worker:", alertMsg)
 				sendAdminAlert(bot, cfg.AdminID, alertMsg)
 				jobChan <- job // requeue before sleeping
@@ -737,6 +737,13 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 			if err := storeImageHash(db, computeDHash(imageBytes)); err != nil {
 				log.Printf("worker: store phash error msg_id=%d: %v", job.msgID, err)
 			}
+			// Advance the worker checkpoint so the crawler knows how far we've
+			// actually processed. On restart the crawler will resume from here
+			// (not from last_crawled_msg_id) to recover any jobs that were
+			// in-flight when the container stopped.
+			if err := setCrawlerState(db, "last_worker_msg_id", strconv.Itoa(job.msgID)); err != nil {
+				log.Printf("worker: save checkpoint error msg_id=%d: %v", job.msgID, err)
+			}
 		}
 
 		preview := desc
@@ -778,9 +785,15 @@ func (m channelMsg) MessageSig() (string, int64) {
 // photoLimit > 0 stops after that many photos are enqueued (dev mode).
 // ctx cancellation stops the crawler gracefully.
 func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, channelID int64, dumpChat *tele.Chat, jobChan chan indexJob, photoLimit int) {
-	lastStr, err := getCrawlerState(db, "last_crawled_msg_id")
-	if err != nil {
-		log.Printf("crawler: cannot read state: %v", err)
+	// Prefer last_worker_msg_id (last msg actually indexed) over last_crawled_msg_id
+	// (last msg forwarded by the crawler). On an abrupt shutdown the in-memory
+	// job queue is lost, so restarting from the worker checkpoint ensures we
+	// re-enqueue any photos that were queued but never indexed.
+	lastStr, err := getCrawlerState(db, "last_worker_msg_id")
+	if err != nil || lastStr == "" {
+		lastStr, _ = getCrawlerState(db, "last_crawled_msg_id")
+	}
+	if lastStr == "" {
 		lastStr = "0"
 	}
 	startID, _ := strconv.Atoi(lastStr)
@@ -1007,6 +1020,10 @@ func main() {
 		if lastCrawled == "" {
 			lastCrawled = "0"
 		}
+		lastWorker, _ := getCrawlerState(db, "last_worker_msg_id")
+		if lastWorker == "" {
+			lastWorker = "0"
+		}
 
 		queueLen := len(jobChan)
 
@@ -1019,13 +1036,15 @@ func main() {
 			"📊 Статус memebot (%s)\n\n"+
 				"🗄 Проиндексировано мемов: %d\n"+
 				"🔍 Последний просмотренный msg_id: %s\n"+
+				"✅ Последний проиндексированный msg_id: %s\n"+
 				"⏳ Очередь на обработку: %d",
-			env, totalMemes, lastCrawled, queueLen,
+			env, totalMemes, lastCrawled, lastWorker, queueLen,
 		)
 		return c.Send(msg)
 	})
 
-	// /analyze — wake the worker from any rate-limit sleep and retry immediately.
+	// /analyze — wake the worker from a per-minute rate-limit sleep and retry immediately.
+	// Does NOT help with daily quota exhaustion — in that case the worker sleeps until midnight UTC.
 	bot.Handle("/analyze", func(c tele.Context) error {
 		if c.Chat().ID != cfg.AdminID {
 			return nil
@@ -1033,9 +1052,9 @@ func main() {
 		select {
 		case workerWake <- struct{}{}:
 			log.Println("admin /analyze: woke worker")
-			return c.Send("⚡ Воркер разбужен, пробую анализировать прямо сейчас.")
+			return c.Send("⚡ Сигнал отправлен. Если воркер спит из-за RPM-лимита — проснётся сразу.\n\nЕсли сработал дневной лимит Gemini — /analyze не поможет, квота сбросится автоматически в 00:05 UTC.")
 		default:
-			return c.Send("ℹ️ Воркер не спит, таймаут не активен.")
+			return c.Send("ℹ️ Воркер не спит (сигнал уже в очереди или таймаут не активен).")
 		}
 	})
 
