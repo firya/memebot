@@ -25,8 +25,8 @@ import (
 	"time"
 
 	"github.com/kljensen/snowball"
-	_ "modernc.org/sqlite"
 	tele "gopkg.in/telebot.v3"
+	_ "modernc.org/sqlite"
 )
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -313,9 +313,17 @@ func setCrawlerState(db *sql.DB, key, value string) error {
 
 var punctRe = regexp.MustCompile(`[^\p{L}\p{N}\s]+`)
 
+// geminiLimitRe extracts the numeric limit from Gemini error messages like "limit: 15".
+// Per-minute limits are small (< 100); daily limits are large (≥ 100).
+var geminiLimitRe = regexp.MustCompile(`limit:\s*(\d+)`)
+
 // errQuotaExceeded is returned by callGemini when the daily API quota is exhausted.
 // The worker must not retry such requests — the quota resets at midnight UTC.
 var errQuotaExceeded = errors.New("gemini daily quota exceeded")
+
+// errRateLimited is returned by callGemini when the per-minute rate limit is hit.
+// The worker should pause ~60 s and retry, NOT sleep until midnight.
+var errRateLimited = errors.New("gemini rate limited (RPM)")
 
 func stripPunct(text string) string {
 	return punctRe.ReplaceAllString(text, " ")
@@ -562,12 +570,23 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 	}
 	if result.Error != nil {
 		msg := result.Error.Message
-		if geminiResp.StatusCode == 429 || strings.Contains(strings.ToLower(msg), "quota") || strings.Contains(msg, "RESOURCE_EXHAUSTED") {
+		msgLower := strings.ToLower(msg)
+		if geminiResp.StatusCode == 429 || strings.Contains(msgLower, "quota") || strings.Contains(msg, "RESOURCE_EXHAUSTED") {
+			// Parse "limit: N" from the message: small limits (< 100) are per-minute, large ones are daily.
+			if m := geminiLimitRe.FindStringSubmatch(msg); m != nil {
+				if n, err := strconv.Atoi(m[1]); err == nil && n < 100 {
+					return "", errRateLimited
+				}
+			}
 			return "", errQuotaExceeded
 		}
 		return "", fmt.Errorf("gemini API error: %s", msg)
 	}
 	if geminiResp.StatusCode == 429 {
+		// No error body — use Retry-After header as signal of RPM limit; otherwise assume daily quota.
+		if geminiResp.Header.Get("Retry-After") != "" {
+			return "", errRateLimited
+		}
 		return "", errQuotaExceeded
 	}
 	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
@@ -604,7 +623,8 @@ type indexJob struct {
 }
 
 // runWorker consumes jobs from jobChan, gated by a ticker to stay within rate limits.
-func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob) {
+// wake is a buffered channel; sending to it interrupts any rate-limit sleep early.
+func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}) {
 	// 2000 ms is a safe default for Claude paid tiers.
 	// If you hit rate limits, increase this to 4500 (like Gemini before).
 	ticker := time.NewTicker(2000 * time.Millisecond)
@@ -655,21 +675,33 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob) {
 
 		desc, err := describeImageFromBytes(cfg, imageBytes, mimeType)
 		if err != nil {
+			if errors.Is(err, errRateLimited) {
+				// Per-minute rate limit — pause up to 60 s (interruptible by /analyze).
+				log.Printf("worker: rate limited (RPM) for msg_id=%d, pausing up to 60s", job.msgID)
+				jobChan <- job // requeue before sleeping
+				select {
+				case <-time.After(60 * time.Second):
+					log.Println("worker: RPM window passed, resuming")
+				case <-wake:
+					log.Println("worker: woken by /analyze, resuming immediately")
+				}
+				continue
+			}
 			if errors.Is(err, errQuotaExceeded) {
-				// Daily quota exhausted — pause until next midnight UTC, then requeue.
+				// Daily quota exhausted — pause until next midnight UTC (interruptible by /analyze).
 				now := time.Now().UTC()
 				nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, time.UTC)
 				waitDur := time.Until(nextMidnight)
-				alertMsg := fmt.Sprintf("Gemini daily quota (500 req) exhausted. Worker paused until %s UTC (~%s)", nextMidnight.Format("2006-01-02 15:04"), waitDur.Round(time.Minute))
+				alertMsg := fmt.Sprintf("Gemini daily quota exhausted. Worker paused until %s UTC (~%s). Разбудить: /analyze", nextMidnight.Format("2006-01-02 15:04"), waitDur.Round(time.Minute))
 				log.Println("worker:", alertMsg)
 				sendAdminAlert(bot, cfg.AdminID, alertMsg)
-				// Requeue the current job to run after reset, then sleep.
-				go func(j indexJob) {
-					time.Sleep(waitDur)
-					jobChan <- j
-				}(job)
-				time.Sleep(waitDur)
-				log.Println("worker: quota reset window reached, resuming")
+				jobChan <- job // requeue before sleeping
+				select {
+				case <-time.After(waitDur):
+					log.Println("worker: quota reset window reached, resuming")
+				case <-wake:
+					log.Println("worker: woken by /analyze, retrying immediately")
+				}
 				continue
 			}
 			const maxRetries = 3
@@ -882,7 +914,8 @@ func main() {
 	log.Printf("channel %s resolved to ID %d", cfg.ChannelUsername, channelID)
 
 	jobChan := make(chan indexJob, 1000)
-	go runWorker(bot, db, cfg, jobChan)
+	workerWake := make(chan struct{}, 1)
+	go runWorker(bot, db, cfg, jobChan, workerWake)
 
 	var crawlerRunning atomic.Bool
 	crawlerCtx, crawlerCancel := context.WithCancel(context.Background())
@@ -990,6 +1023,20 @@ func main() {
 			env, totalMemes, lastCrawled, queueLen,
 		)
 		return c.Send(msg)
+	})
+
+	// /analyze — wake the worker from any rate-limit sleep and retry immediately.
+	bot.Handle("/analyze", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		select {
+		case workerWake <- struct{}{}:
+			log.Println("admin /analyze: woke worker")
+			return c.Send("⚡ Воркер разбужен, пробую анализировать прямо сейчас.")
+		default:
+			return c.Send("ℹ️ Воркер не спит, таймаут не активен.")
+		}
 	})
 
 	// /stop — stop crawler without resetting DB (dev and prod)
