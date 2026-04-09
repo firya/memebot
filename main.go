@@ -901,6 +901,36 @@ func resolveChannelID(token, username string) (int64, error) {
 	return result.Result.ID, nil
 }
 
+// ─── Status helpers ───────────────────────────────────────────────────────────
+
+func buildStatusMsg(db *sql.DB, jobChan chan indexJob, devMode bool) string {
+	var totalMemes int
+	db.QueryRow("SELECT count(*) FROM memes").Scan(&totalMemes)
+
+	lastCrawled, _ := getCrawlerState(db, "last_crawled_msg_id")
+	if lastCrawled == "" {
+		lastCrawled = "0"
+	}
+	lastWorker, _ := getCrawlerState(db, "last_worker_msg_id")
+	if lastWorker == "" {
+		lastWorker = "0"
+	}
+
+	env := "prod"
+	if devMode {
+		env = "dev"
+	}
+
+	return fmt.Sprintf(
+		"📊 Статус memebot (%s)\n\n"+
+			"🗄 Проиндексировано мемов: %d\n"+
+			"🔍 Последний просмотренный msg_id: %s\n"+
+			"✅ Последний проиндексированный msg_id: %s\n"+
+			"⏳ Очередь на обработку: %d",
+		env, totalMemes, lastCrawled, lastWorker, len(jobChan),
+	)
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -931,6 +961,22 @@ func main() {
 	go runWorker(bot, db, cfg, jobChan, workerWake)
 
 	var crawlerRunning atomic.Bool
+
+	// Periodic status reporter: sends /status to admin every 5 minutes while
+	// the crawler is running or there are jobs waiting in the queue.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		admin := &tele.User{ID: cfg.AdminID}
+		for range ticker.C {
+			if !crawlerRunning.Load() && len(jobChan) == 0 {
+				continue
+			}
+			if _, err := bot.Send(admin, buildStatusMsg(db, jobChan, cfg.DevMode)); err != nil {
+				log.Printf("status ticker: send failed: %v", err)
+			}
+		}
+	}()
 	crawlerCtx, crawlerCancel := context.WithCancel(context.Background())
 
 	startCrawler := func(photoLimit int) {
@@ -1012,35 +1058,34 @@ func main() {
 		if c.Chat().ID != cfg.AdminID {
 			return nil
 		}
+		return c.Send(buildStatusMsg(db, jobChan, cfg.DevMode))
+	})
 
-		var totalMemes int
-		db.QueryRow("SELECT count(*) FROM memes").Scan(&totalMemes)
-
-		lastCrawled, _ := getCrawlerState(db, "last_crawled_msg_id")
-		if lastCrawled == "" {
-			lastCrawled = "0"
+	// /help — command reference for the admin
+	bot.Handle("/help", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
 		}
-		lastWorker, _ := getCrawlerState(db, "last_worker_msg_id")
-		if lastWorker == "" {
-			lastWorker = "0"
-		}
-
-		queueLen := len(jobChan)
-
-		env := "prod"
+		devSection := ""
 		if cfg.DevMode {
-			env = "dev"
+			devSection = "\n\n*Только dev-режим:*\n" +
+				"`/index <n>` — сбросить БД и проиндексировать первые N фото (по умолчанию 10)"
 		}
-
-		msg := fmt.Sprintf(
-			"📊 Статус memebot (%s)\n\n"+
-				"🗄 Проиндексировано мемов: %d\n"+
-				"🔍 Последний просмотренный msg_id: %s\n"+
-				"✅ Последний проиндексированный msg_id: %s\n"+
-				"⏳ Очередь на обработку: %d",
-			env, totalMemes, lastCrawled, lastWorker, queueLen,
-		)
-		return c.Send(msg)
+		text := "*Команды memebot*\n\n" +
+			"*Индексация:*\n" +
+			"`/status` — статистика: мемов в БД, прогресс краулера, длина очереди\n" +
+			"`/resume` — продолжить краулер с последнего сохранённого msg\\_id\n" +
+			"`/stop` — остановить краулер (прогресс сохраняется, возобновить: /resume)\n" +
+			"`/reset` — сбросить БД и запустить краулер с начала канала\n" +
+			"`/reset <n>` — сбросить БД и проиндексировать первые N фото (dev)\n\n" +
+			"*Воркер / AI:*\n" +
+			"`/analyze` — разбудить воркер досрочно, если он спит из-за RPM-лимита\n" +
+			"_(при дневном лимите Gemini не поможет — квота сбросится в 00:05 UTC)_\n\n" +
+			"*Поиск:*\n" +
+			"Inline-поиск работает везде: `@botusername запрос`\n" +
+			"Бот понимает русский язык со стеммингом — достаточно части слова" +
+			devSection
+		return c.Send(text, tele.ModeMarkdown)
 	})
 
 	// /analyze — wake the worker from a per-minute rate-limit sleep and retry immediately.

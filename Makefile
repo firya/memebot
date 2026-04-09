@@ -23,13 +23,19 @@ help: ## Показать это сообщение
 	@printf "  $(CYAN)%-15s$(RESET) %s\n" ".env"          "Конфигурация (токены, ID чатов)"
 	@printf "  $(CYAN)%-15s$(RESET) %s\n" "data/memes.db" "База данных SQLite с индексом мемов"
 	@echo ""
-	@echo "  $(BOLD)Команды боту в Telegram (dev-режим):$(RESET)"
-	@printf "  $(CYAN)%-15s$(RESET) %s\n" "/index 10"    "Сбросить БД и проиндексировать 10 фото с начала"
-	@printf "  $(CYAN)%-15s$(RESET) %s\n" "/index"       "То же самое, дефолт 10 фото"
+	@echo "  $(BOLD)Команды боту в Telegram (личка, только ADMIN_ID):$(RESET)"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/help"         "Справка по всем командам"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/status"       "Статистика: мемов, прогресс краулера, очередь"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/resume"       "Продолжить краулер с последнего msg_id"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/stop"         "Остановить краулер (прогресс сохраняется)"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/reset"        "Сбросить БД и перезапустить краулер"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/reset <n>"    "Сбросить БД и проиндексировать N фото (dev)"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/index <n>"    "Алиас для /reset <n> (только dev)"
+	@printf "  $(CYAN)%-18s$(RESET) %s\n" "/analyze"      "Разбудить воркер при RPM-лимите"
 	@echo ""
 
 up: ## Собрать и запустить в фоне
-	docker compose up --build -dДавай
+	docker compose up --build -d
 	@echo ""
 	@echo "  Запущен. Логи: $(CYAN)make logs$(RESET)"
 
