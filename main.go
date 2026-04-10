@@ -33,8 +33,6 @@ import (
 
 type Config struct {
 	TelegramToken      string
-	AIProvider         string // "claude" | "gemini"
-	ClaudeAPIKey       string
 	GeminiAPIKey       string
 	GeminiWorkerURL    string // Cloudflare Worker URL (replaces direct googleapis.com call)
 	GeminiWorkerSecret string // X-Worker-Secret header value
@@ -79,25 +77,9 @@ func loadConfig() Config {
 		}
 	}
 
-	provider := os.Getenv("AI_PROVIDER")
-	if provider == "" {
-		provider = "claude"
-	}
-	var claudeKey, geminiKey string
-	switch provider {
-	case "claude":
-		claudeKey = must("CLAUDE_API_KEY")
-	case "gemini":
-		geminiKey = must("GEMINI_API_KEY")
-	default:
-		log.Fatalf("unknown AI_PROVIDER: %s (use 'claude' or 'gemini')", provider)
-	}
-
 	return Config{
 		TelegramToken:      must("TELEGRAM_TOKEN"),
-		AIProvider:         provider,
-		ClaudeAPIKey:       claudeKey,
-		GeminiAPIKey:       geminiKey,
+		GeminiAPIKey:       must("GEMINI_API_KEY"),
 		GeminiWorkerURL:    os.Getenv("GEMINI_WORKER_URL"),
 		GeminiWorkerSecret: os.Getenv("GEMINI_WORKER_SECRET"),
 		ChannelUsername:    must("CHANNEL_USERNAME"),
@@ -442,78 +424,6 @@ func fetchImageBytes(cfg Config, fileID string) ([]byte, string, error) {
 	return imageBytes, mimeType, nil
 }
 
-// callClaude sends imageBytes to the Claude vision API and returns the description.
-func callClaude(apiKey string, imageBytes []byte, mimeType string) (string, error) {
-	type imageSource struct {
-		Type      string `json:"type"`
-		MediaType string `json:"media_type"`
-		Data      string `json:"data"`
-	}
-	type content struct {
-		Type   string       `json:"type"`
-		Text   string       `json:"text,omitempty"`
-		Source *imageSource `json:"source,omitempty"`
-	}
-	type message struct {
-		Role    string    `json:"role"`
-		Content []content `json:"content"`
-	}
-	reqBody := struct {
-		Model     string    `json:"model"`
-		MaxTokens int       `json:"max_tokens"`
-		Messages  []message `json:"messages"`
-	}{
-		Model:     "claude-haiku-4-5-20251001",
-		MaxTokens: 1000,
-		Messages: []message{{
-			Role: "user",
-			Content: []content{
-				{Type: "image", Source: &imageSource{Type: "base64", MediaType: mimeType, Data: base64.StdEncoding.EncodeToString(imageBytes)}},
-				{Type: "text", Text: aiPrompt},
-			},
-		}},
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal claude request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", fmt.Errorf("create claude request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	claudeResp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return "", fmt.Errorf("claude HTTP request: %w", err)
-	}
-	defer claudeResp.Body.Close()
-
-	var result struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-		Error *struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(claudeResp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode claude response: %w", err)
-	}
-	if result.Error != nil {
-		return "", fmt.Errorf("claude API error [%s]: %s", result.Error.Type, result.Error.Message)
-	}
-	if len(result.Content) == 0 {
-		return "", fmt.Errorf("empty claude response")
-	}
-	return strings.TrimSpace(result.Content[0].Text), nil
-}
-
 // callGemini sends imageBytes to the Gemini vision API and returns the description.
 // workerURL overrides the googleapis.com base URL (Cloudflare Worker); empty means direct.
 // workerSecret is sent as X-Worker-Secret if set.
@@ -608,10 +518,7 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 
 // describeImageFromBytes sends pre-fetched image bytes to the configured AI provider.
 func describeImageFromBytes(cfg Config, imageBytes []byte, mimeType string) (string, error) {
-	if cfg.AIProvider == "gemini" {
-		return callGemini(cfg.GeminiAPIKey, cfg.GeminiWorkerURL, cfg.GeminiWorkerSecret, imageBytes, mimeType)
-	}
-	return callClaude(cfg.ClaudeAPIKey, imageBytes, mimeType)
+	return callGemini(cfg.GeminiAPIKey, cfg.GeminiWorkerURL, cfg.GeminiWorkerSecret, imageBytes, mimeType)
 }
 
 // ─── Admin alerts ─────────────────────────────────────────────────────────────
