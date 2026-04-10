@@ -316,6 +316,7 @@ func main() {
 		if err := resetDB(db); err != nil {
 			return c.Send("❌ Ошибка сброса БД: " + err.Error())
 		}
+		hashes = hashes[:0] // clear in-memory hash cache so reset images aren't treated as duplicates
 		if cfg.DevMode {
 			n := 10
 			if arg := c.Message().Payload; arg != "" {
@@ -345,6 +346,7 @@ func main() {
 			if err := resetDB(db); err != nil {
 				return c.Send("❌ Ошибка сброса БД: " + err.Error())
 			}
+			hashes = hashes[:0]
 			if err := c.Send(fmt.Sprintf("🔄 Запускаю индексацию %d фото с начала канала...", n)); err != nil {
 				log.Printf("admin: send failed: %v", err)
 			}
