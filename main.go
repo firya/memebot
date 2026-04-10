@@ -142,6 +142,11 @@ func initDB(path string) (*sql.DB, error) {
 	CREATE TABLE IF NOT EXISTS image_hashes (
 		phash INTEGER NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS failed_msgs (
+		msg_id  INTEGER PRIMARY KEY,
+		file_id TEXT NOT NULL
+	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -157,6 +162,7 @@ func resetDB(db *sql.DB) error {
 		DELETE FROM indexed_msgs;
 		DELETE FROM crawler_state;
 		DELETE FROM image_hashes;
+		DELETE FROM failed_msgs;
 	`)
 	return err
 }
@@ -725,6 +731,11 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 				if job.replyTo > 0 {
 					chat := &tele.Chat{ID: job.replyTo}
 					bot.Send(chat, "❌ Ошибка AI: "+err.Error())
+				} else {
+					// Persist failed job so it is retried on next restart.
+					if _, dbErr := db.Exec("INSERT OR REPLACE INTO failed_msgs(msg_id, file_id) VALUES (?, ?)", job.msgID, job.fileID); dbErr != nil {
+						log.Printf("worker: save failed_msg error msg_id=%d: %v", job.msgID, dbErr)
+					}
 				}
 			}
 			continue
@@ -742,6 +753,10 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 		if job.replyTo == 0 {
 			if err := storeImageHash(db, computeDHash(imageBytes)); err != nil {
 				log.Printf("worker: store phash error msg_id=%d: %v", job.msgID, err)
+			}
+			// Remove from failed_msgs if this was a previously failed job.
+			if _, err := db.Exec("DELETE FROM failed_msgs WHERE msg_id = ?", job.msgID); err != nil {
+				log.Printf("worker: clear failed_msg error msg_id=%d: %v", job.msgID, err)
 			}
 			// Advance the worker checkpoint so the crawler knows how far we've
 			// actually processed. On restart the crawler will resume from here
@@ -988,6 +1003,27 @@ func main() {
 	workerWake := make(chan struct{}, 1)
 	var workerQuotaUntil atomic.Int64
 	go runWorker(bot, db, cfg, jobChan, workerWake, &workerQuotaUntil)
+
+	// Re-queue any jobs that permanently failed in a previous session.
+	{
+		rows, err := db.Query("SELECT msg_id, file_id FROM failed_msgs ORDER BY msg_id")
+		if err != nil {
+			log.Printf("startup: load failed_msgs error: %v", err)
+		} else {
+			var requeued int
+			for rows.Next() {
+				var job indexJob
+				if err := rows.Scan(&job.msgID, &job.fileID); err == nil {
+					jobChan <- job
+					requeued++
+				}
+			}
+			rows.Close()
+			if requeued > 0 {
+				log.Printf("startup: re-queued %d previously failed jobs", requeued)
+			}
+		}
+	}
 
 	var crawlerRunning atomic.Bool
 
