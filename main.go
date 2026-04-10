@@ -310,8 +310,15 @@ func main() {
 			time.Sleep(500 * time.Millisecond)
 			crawlerCtx, crawlerCancel = context.WithCancel(context.Background())
 		}
-		for len(jobChan) > 0 {
-			<-jobChan
+		// Drain channel non-blockingly to avoid deadlock when the worker
+		// takes the last job while this loop is running.
+	drain:
+		for {
+			select {
+			case <-jobChan:
+			default:
+				break drain
+			}
 		}
 		if err := resetDB(db); err != nil {
 			return c.Send("❌ Ошибка сброса БД: " + err.Error())
