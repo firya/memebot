@@ -120,6 +120,9 @@ func initDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// SQLite supports only one writer at a time. A single connection
+	// serialises all operations and eliminates SQLITE_BUSY errors.
+	db.SetMaxOpenConns(1)
 
 	schema := `
 	CREATE VIRTUAL TABLE IF NOT EXISTS memes USING fts5(
