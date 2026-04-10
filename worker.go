@@ -73,6 +73,22 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 		imageBytes, mimeType, err := fetchImageBytes(cfg, job.fileID)
 		if err != nil {
 			log.Printf("worker: fetch error msg_id=%d: %v", job.msgID, err)
+			const maxFetchRetries = 5
+			if job.replyTo == 0 && job.retries < maxFetchRetries {
+				job.retries++
+				delay := time.Duration(job.retries*30) * time.Second
+				log.Printf("worker: fetch retry %d/%d msg_id=%d in %s", job.retries, maxFetchRetries, job.msgID, delay)
+				go func(j indexJob) {
+					time.Sleep(delay)
+					jobChan <- j
+				}(job)
+			} else if job.replyTo == 0 {
+				errMsg := fmt.Sprintf("fetch permanently failed for msg_id=%d (retries=%d): %v", job.msgID, job.retries, err)
+				sendAdminAlert(bot, cfg.AdminID, errMsg)
+				if _, dbErr := db.Exec("INSERT OR REPLACE INTO failed_msgs(msg_id, file_id) VALUES (?, ?)", job.msgID, job.fileID); dbErr != nil {
+					log.Printf("worker: save failed_msg error msg_id=%d: %v", job.msgID, dbErr)
+				}
+			}
 			continue
 		}
 
