@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 
-	tele "gopkg.in/telebot.v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -116,7 +115,14 @@ func truncateCaption(s string) string {
 	return string(runes[:limit-3]) + "..."
 }
 
-func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
+// MemeResult holds the data for a single inline query result.
+type MemeResult struct {
+	FileID  string
+	Rowid   int64
+	Caption string
+}
+
+func searchMemes(db *sql.DB, ftsQuery string) ([]MemeResult, error) {
 	rows, err := db.Query(
 		`SELECT file_id, rowid, original_desc FROM memes WHERE search_vector MATCH ? ORDER BY rank LIMIT 50`,
 		ftsQuery,
@@ -126,17 +132,17 @@ func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
 	}
 	defer rows.Close()
 
-	results := make([]tele.Result, 0)
+	var results []MemeResult
 	for rows.Next() {
 		var fileID, originalDesc string
 		var rowid int64
 		if err := rows.Scan(&fileID, &rowid, &originalDesc); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		results = append(results, &tele.PhotoResult{
-			ResultBase: tele.ResultBase{ID: strconv.FormatInt(rowid, 10)},
-			Cache:      fileID,
-			Caption:    truncateCaption(originalDesc),
+		results = append(results, MemeResult{
+			FileID:  fileID,
+			Rowid:   rowid,
+			Caption: truncateCaption(originalDesc),
 		})
 	}
 

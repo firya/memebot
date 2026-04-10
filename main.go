@@ -207,16 +207,48 @@ func main() {
 		return nil
 	})
 
+	// inlineEmpty answers an inline query with zero results.
+	// Using Raw avoids telebot's Results marshaler which injects empty
+	// photo_url/thumbnail_url fields and can confuse some Telegram servers.
+	type inlineCachedPhoto struct {
+		Type        string `json:"type"`
+		ID          string `json:"id"`
+		PhotoFileID string `json:"photo_file_id"`
+		Caption     string `json:"caption,omitempty"`
+	}
+	type inlineAnswer struct {
+		QueryID   string              `json:"inline_query_id"`
+		Results   []inlineCachedPhoto `json:"results"`
+		CacheTime int                 `json:"cache_time"`
+	}
+	answerInline := func(c tele.Context, memes []MemeResult, cacheTime int) error {
+		resp := inlineAnswer{
+			QueryID:   c.Query().ID,
+			CacheTime: cacheTime,
+			Results:   make([]inlineCachedPhoto, len(memes)),
+		}
+		for i, m := range memes {
+			resp.Results[i] = inlineCachedPhoto{
+				Type:        "photo",
+				ID:          strconv.FormatInt(m.Rowid, 10),
+				PhotoFileID: m.FileID,
+				Caption:     m.Caption,
+			}
+		}
+		_, err := c.Bot().Raw("answerInlineQuery", resp)
+		return err
+	}
+
 	// Inline search handler
 	bot.Handle(tele.OnQuery, func(c tele.Context) error {
 		query := strings.TrimSpace(c.Query().Text)
 		if query == "" {
-			return c.Answer(&tele.QueryResponse{Results: []tele.Result{}, CacheTime: 1})
+			return answerInline(c, nil, 1)
 		}
 
 		ftsQuery := buildFTSQuery(query)
 		if ftsQuery == "" {
-			return c.Answer(&tele.QueryResponse{Results: []tele.Result{}, CacheTime: 1})
+			return answerInline(c, nil, 1)
 		}
 
 		log.Printf("inline: %q → FTS: %q", query, ftsQuery)
@@ -224,14 +256,11 @@ func main() {
 		results, err := searchMemes(db, ftsQuery)
 		if err != nil {
 			log.Printf("inline: search error: %v", err)
-			return c.Answer(&tele.QueryResponse{Results: []tele.Result{}, CacheTime: 1})
+			return answerInline(c, nil, 1)
 		}
 
 		log.Printf("inline: %d result(s) for %q", len(results), query)
-		return c.Answer(&tele.QueryResponse{
-			Results:   results,
-			CacheTime: 30,
-		})
+		return answerInline(c, results, 30)
 	})
 
 	bot.Handle("/status", func(c tele.Context) error {
