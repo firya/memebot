@@ -806,7 +806,16 @@ func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, ch
 	log.Printf("crawler: starting from msg_id=%d (photoLimit=%d, maxGap=%d)", startID+1, photoLimit, cfg.CrawlerMaxGap)
 
 	consecutiveMisses := 0
+	consecutiveTransient := 0
 	photosEnqueued := 0
+
+	// ctxSleep sleeps for d but returns early if ctx is cancelled.
+	ctxSleep := func(d time.Duration) {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
+	}
 
 	for msgID := startID + 1; ; msgID++ {
 		// Check for external stop signal
@@ -822,15 +831,22 @@ func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, ch
 			break
 		}
 
-		time.Sleep(60 * time.Millisecond) // ~16 req/s to Telegram, well under flood limit
+		ctxSleep(60 * time.Millisecond) // ~16 req/s to Telegram, well under flood limit
 
 		copied, err := bot.Forward(dumpChat, channelMsg{id: msgID, chatID: channelID})
 		if err != nil {
 			errStr := err.Error()
 			// Rate limit or transient network error — pause and retry same msgID
 			if strings.Contains(errStr, "retry") || strings.Contains(errStr, "Too Many") || strings.Contains(errStr, "timeout") {
-				log.Printf("crawler: transient error at msg_id=%d, pausing 10s: %v", msgID, err)
-				time.Sleep(10 * time.Second)
+				consecutiveTransient++
+				// Exponential backoff: 10s, 20s, 40s … capped at 5 min.
+				backoff := time.Duration(10<<min(consecutiveTransient-1, 5)) * time.Second
+				log.Printf("crawler: transient error #%d at msg_id=%d, pausing %s: %v", consecutiveTransient, msgID, backoff, err)
+				ctxSleep(backoff)
+				if ctx.Err() != nil {
+					log.Println("crawler: stopped by request during backoff")
+					return
+				}
 				msgID-- // retry same ID
 				continue
 			}
@@ -843,6 +859,7 @@ func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, ch
 			continue
 		}
 		consecutiveMisses = 0
+		consecutiveTransient = 0
 
 		// Persist progress immediately
 		if saveErr := setCrawlerState(db, "last_crawled_msg_id", strconv.Itoa(msgID)); saveErr != nil {
