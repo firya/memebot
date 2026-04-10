@@ -125,8 +125,18 @@ func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, ch
 			// Rate limit or transient network error — pause and retry same msgID
 			if strings.Contains(errStr, "retry") || strings.Contains(errStr, "Too Many") || strings.Contains(errStr, "timeout") || strings.Contains(errStr, "Timeout") || strings.Contains(errStr, "deadline exceeded") {
 				consecutiveTransient++
+				// After too many transient failures on the same message, skip it.
+				// This prevents the crawler from hanging forever on a single msgID
+				// when Telegram issues large retry-after values repeatedly.
+				const maxTransientPerMsg = 5
+				if consecutiveTransient > maxTransientPerMsg {
+					log.Printf("crawler: too many transient errors for msg_id=%d (%d attempts), skipping", msgID, consecutiveTransient)
+					consecutiveTransient = 0
+					continue // advance to next msgID
+				}
 				// Respect Telegram's Retry-After if present (e.g. "retry after 1307").
 				// Fall back to exponential backoff: 10s, 20s, 40s … capped at 5 min.
+				const maxBackoff = 5 * time.Minute
 				backoff := time.Duration(10<<min(consecutiveTransient-1, 5)) * time.Second
 				if idx := strings.Index(errStr, "retry after "); idx != -1 {
 					rest := errStr[idx+len("retry after "):]
@@ -138,6 +148,9 @@ func crawlHistory(ctx context.Context, bot *tele.Bot, db *sql.DB, cfg Config, ch
 					if secs, parseErr := strconv.Atoi(rest); parseErr == nil && secs > 0 {
 						backoff = time.Duration(secs) * time.Second
 					}
+				}
+				if backoff > maxBackoff {
+					backoff = maxBackoff
 				}
 				log.Printf("crawler: transient error #%d at msg_id=%d, pausing %s: %v", consecutiveTransient, msgID, backoff, err)
 				ctxSleep(backoff)
