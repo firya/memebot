@@ -1026,15 +1026,20 @@ func main() {
 	}
 
 	var crawlerRunning atomic.Bool
+	var manuallyStopped atomic.Bool
 
 	// Periodic status reporter: sends /status to admin every 5 minutes while
 	// the crawler is running or there are jobs waiting in the queue.
-	// Suppressed while the worker is sleeping due to daily quota exhaustion.
+	// Suppressed while the worker is sleeping due to daily quota exhaustion,
+	// or after the user has manually stopped the crawler via /stop.
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		admin := &tele.User{ID: cfg.AdminID}
 		for range ticker.C {
+			if manuallyStopped.Load() {
+				continue
+			}
 			if !crawlerRunning.Load() && len(jobChan) == 0 {
 				continue
 			}
@@ -1180,6 +1185,7 @@ func main() {
 		if !crawlerRunning.Load() {
 			return c.Send("ℹ️ Краулер не запущен.")
 		}
+		manuallyStopped.Store(true)
 		crawlerCancel()
 		crawlerCtx, crawlerCancel = context.WithCancel(context.Background())
 		return c.Send("⏹ Индексирование остановлено. Прогресс сохранён, возобновить: /resume")
@@ -1193,6 +1199,7 @@ func main() {
 		if crawlerRunning.Load() {
 			return c.Send("⚠️ Краулер уже запущен.")
 		}
+		manuallyStopped.Store(false)
 		lastCrawled, _ := getCrawlerState(db, "last_crawled_msg_id")
 		if lastCrawled == "" {
 			lastCrawled = "0"
