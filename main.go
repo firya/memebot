@@ -633,19 +633,34 @@ type indexJob struct {
 	retries int   // number of AI retry attempts so far
 }
 
+// workerIntervalEconom and workerIntervalBoost define the request cadence
+// for the two rate-limit modes selectable via /econom and /boost.
+const (
+	workerIntervalEconom = 4000 * time.Millisecond // 15 RPM / 500 RPD (free tier)
+	workerIntervalBoost  = 15 * time.Millisecond   // 4000 RPM / 150000 RPD (paid tier)
+)
+
 // runWorker consumes jobs from jobChan, gated by a ticker to stay within rate limits.
 // wake is a buffered channel; sending to it interrupts any rate-limit sleep early.
 // quotaUntil is set to the Unix timestamp of the planned wakeup while the worker
 // sleeps due to daily quota exhaustion, and reset to 0 when it resumes.
-func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}, quotaUntil *atomic.Int64) {
-	// 2000 ms is a safe default for Claude paid tiers.
-	// If you hit rate limits, increase this to 4500 (like Gemini before).
-	ticker := time.NewTicker(2000 * time.Millisecond)
+// intervalNs holds the current ticker interval in nanoseconds; writing to it
+// causes the worker to reset its ticker on the next iteration.
+func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}, quotaUntil *atomic.Int64, intervalNs *atomic.Int64) {
+	currentInterval := workerIntervalEconom
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
-	log.Println("worker pool started (rate limit: 1 req / 2 s)")
+	log.Printf("worker started (interval: %s)", currentInterval)
 
 	for job := range jobChan {
+		// Apply interval change requested via /boost or /econom.
+		if d := time.Duration(intervalNs.Load()); d != currentInterval {
+			currentInterval = d
+			ticker.Reset(currentInterval)
+			log.Printf("worker: interval changed to %s", currentInterval)
+		}
+
 		<-ticker.C // wait for the rate-limit window
 
 		// Skip dedup for admin DM photos (replyTo > 0, no channel msgID)
@@ -1005,7 +1020,9 @@ func main() {
 	jobChan := make(chan indexJob, 1000)
 	workerWake := make(chan struct{}, 1)
 	var workerQuotaUntil atomic.Int64
-	go runWorker(bot, db, cfg, jobChan, workerWake, &workerQuotaUntil)
+	var workerIntervalNs atomic.Int64
+	workerIntervalNs.Store(int64(workerIntervalEconom))
+	go runWorker(bot, db, cfg, jobChan, workerWake, &workerQuotaUntil, &workerIntervalNs)
 
 	// Re-queue any jobs that permanently failed in a previous session.
 	{
@@ -1157,7 +1174,9 @@ func main() {
 			"`/reset <n>` — сбросить БД и проиндексировать первые N фото (dev)\n\n" +
 			"*Воркер / AI:*\n" +
 			"`/analyze` — разбудить воркер досрочно, если он спит из-за RPM-лимита\n" +
-			"_(при дневном лимите Gemini не поможет — квота сбросится в 00:05 UTC)_\n\n" +
+			"_(при дневном лимите Gemini не поможет — квота сбросится в 00:05 UTC)_\n" +
+			"`/boost` — платный тариф (4000 RPM / 150000 RPD)\n" +
+			"`/econom` — бесплатный тариф (15 RPM / 500 RPD)\n\n" +
 			"*Поиск:*\n" +
 			"Inline-поиск работает везде: `@botusername запрос`\n" +
 			"Бот понимает русский язык со стеммингом — достаточно части слова" +
@@ -1209,6 +1228,24 @@ func main() {
 		}
 		startCrawler(0)
 		return c.Send(fmt.Sprintf("▶️ Продолжаю индексацию с msg_id=%s...", lastCrawled))
+	})
+
+	// /boost — switch worker to paid-tier rate limit (~4000 RPM)
+	bot.Handle("/boost", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		workerIntervalNs.Store(int64(workerIntervalBoost))
+		return c.Send("⚡ Boost mode: 4000 RPM / 150000 RPD (15 мс/запрос). Вернуть: /econom")
+	})
+
+	// /econom — switch worker back to free-tier rate limit (~30 RPM)
+	bot.Handle("/econom", func(c tele.Context) error {
+		if c.Chat().ID != cfg.AdminID {
+			return nil
+		}
+		workerIntervalNs.Store(int64(workerIntervalEconom))
+		return c.Send("🐢 Econom mode: 15 RPM / 500 RPD (4000 мс/запрос).")
 	})
 
 	// /reset — resets DB and restarts crawler (dev and prod)
