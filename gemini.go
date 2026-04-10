@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const geminiModel = "gemini-2.0-flash-lite"
+const geminiModel = "gemini-3.1-flash-lite-preview"
 
 // Package-level HTTP clients with connection pooling. Creating a new client
 // per request forgoes keep-alive connections and wastes sockets.
