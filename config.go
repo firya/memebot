@@ -7,16 +7,18 @@ import (
 )
 
 type Config struct {
-	TelegramToken      string
-	GeminiAPIKey       string
-	GeminiWorkerURL    string // Cloudflare Worker URL (replaces direct googleapis.com call)
-	GeminiWorkerSecret string // X-Worker-Secret header value
-	ChannelUsername    string // e.g. "@mychannel"
-	DumpChatID         int64
-	AdminID            int64
-	DBPath             string
-	DevMode            bool // APP_ENV=dev
-	CrawlerMaxGap      int  // consecutive misses before history is considered exhausted
+	TelegramToken         string
+	TelegramAPIURL        string // Cloudflare Worker URL (replaces direct api.telegram.org)
+	TelegramWorkerSecret  string // X-Worker-Secret header value for Telegram worker
+	GeminiAPIKey          string
+	GeminiWorkerURL       string // Cloudflare Worker URL (replaces direct googleapis.com call)
+	GeminiWorkerSecret    string // X-Worker-Secret header value
+	ChannelUsername       string // e.g. "@mychannel"
+	DumpChatID            int64
+	AdminID               int64
+	DBPath                string
+	DevMode               bool // APP_ENV=dev
+	CrawlerMaxGap         int  // consecutive misses before history is considered exhausted
 }
 
 func loadConfig() Config {
@@ -53,15 +55,17 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		TelegramToken:      must("TELEGRAM_TOKEN"),
-		GeminiAPIKey:       must("GEMINI_API_KEY"),
-		GeminiWorkerURL:    os.Getenv("GEMINI_WORKER_URL"),
-		GeminiWorkerSecret: os.Getenv("GEMINI_WORKER_SECRET"),
-		ChannelUsername:    must("CHANNEL_USERNAME"),
-		DumpChatID:         dumpChatID,
-		AdminID:            adminID,
-		DBPath:             dbPath,
-		DevMode:            devMode,
-		CrawlerMaxGap:      crawlerMaxGap,
+		TelegramToken:        must("TELEGRAM_TOKEN"),
+		TelegramAPIURL:       os.Getenv("TELEGRAM_API_URL"),
+		TelegramWorkerSecret: os.Getenv("TELEGRAM_WORKER_SECRET"),
+		GeminiAPIKey:         must("GEMINI_API_KEY"),
+		GeminiWorkerURL:      os.Getenv("GEMINI_WORKER_URL"),
+		GeminiWorkerSecret:   os.Getenv("GEMINI_WORKER_SECRET"),
+		ChannelUsername:      must("CHANNEL_USERNAME"),
+		DumpChatID:           dumpChatID,
+		AdminID:              adminID,
+		DBPath:               dbPath,
+		DevMode:              devMode,
+		CrawlerMaxGap:        crawlerMaxGap,
 	}
 }

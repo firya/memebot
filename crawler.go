@@ -26,16 +26,31 @@ func (m channelMsg) MessageSig() (string, int64) {
 }
 
 // resolveChannelID calls getChat to obtain the numeric ID for a channel username.
-func resolveChannelID(token, username string) (int64, error) {
+// apiURL overrides the default api.telegram.org base (e.g. a Cloudflare Worker).
+// secret is sent as X-Worker-Secret if non-empty.
+func resolveChannelID(token, username, apiURL, secret string) (int64, error) {
+	base := "https://api.telegram.org"
+	if apiURL != "" {
+		base = strings.TrimRight(apiURL, "/")
+	}
 	return resolveChannelIDURL(
-		fmt.Sprintf("https://api.telegram.org/bot%s/getChat?chat_id=%s", token, username),
+		fmt.Sprintf("%s/bot%s/getChat?chat_id=%s", base, token, username),
+		secret,
 	)
 }
 
 // resolveChannelIDURL fetches and decodes a getChat response from the given URL.
 // Separated from resolveChannelID so tests can inject a mock server URL.
-func resolveChannelIDURL(rawURL string) (int64, error) {
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(rawURL)
+// secret is sent as X-Worker-Secret if non-empty.
+func resolveChannelIDURL(rawURL, secret string) (int64, error) {
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("getChat request: %w", err)
+	}
+	if secret != "" {
+		req.Header.Set("X-Worker-Secret", secret)
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("getChat request: %w", err)
 	}

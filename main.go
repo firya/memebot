@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -11,6 +12,19 @@ import (
 
 	tele "gopkg.in/telebot.v3"
 )
+
+// workerTransport injects X-Worker-Secret into every outbound request,
+// allowing Cloudflare Worker auth for all Telegram Bot API calls.
+type workerTransport struct {
+	base   http.RoundTripper
+	secret string
+}
+
+func (t *workerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("X-Worker-Secret", t.secret)
+	return t.base.RoundTrip(req)
+}
 
 func main() {
 	cfg := loadConfig()
@@ -21,15 +35,27 @@ func main() {
 	}
 	defer db.Close()
 
-	bot, err := tele.NewBot(tele.Settings{
+	botSettings := tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
-	})
+	}
+	if cfg.TelegramAPIURL != "" {
+		botSettings.URL = cfg.TelegramAPIURL
+		if cfg.TelegramWorkerSecret != "" {
+			botSettings.Client = &http.Client{
+				Transport: &workerTransport{
+					base:   http.DefaultTransport,
+					secret: cfg.TelegramWorkerSecret,
+				},
+			}
+		}
+	}
+	bot, err := tele.NewBot(botSettings)
 	if err != nil {
 		log.Fatalf("bot init: %v", err)
 	}
 
-	channelID, err := resolveChannelID(cfg.TelegramToken, cfg.ChannelUsername)
+	channelID, err := resolveChannelID(cfg.TelegramToken, cfg.ChannelUsername, cfg.TelegramAPIURL, cfg.TelegramWorkerSecret)
 	if err != nil {
 		log.Fatalf("resolve channel: %v", err)
 	}

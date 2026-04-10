@@ -31,7 +31,7 @@ func TestResolveChannelID_Success(t *testing.T) {
 	// resolveChannelID builds its own URL, so we pass a fake token and intercept
 	// by temporarily overriding the transport used for getChat.
 	// Instead, call the underlying HTTP directly against the test server.
-	id, err := resolveChannelIDURL(srv.URL)
+	id, err := resolveChannelIDURL(srv.URL, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestResolveChannelID_NotOK(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := resolveChannelIDURL(srv.URL)
+	_, err := resolveChannelIDURL(srv.URL, "")
 	if err == nil {
 		t.Fatal("expected error for ok=false response")
 	}
@@ -61,14 +61,14 @@ func TestResolveChannelID_BadJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := resolveChannelIDURL(srv.URL)
+	_, err := resolveChannelIDURL(srv.URL, "")
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
 }
 
 func TestResolveChannelID_NetworkError(t *testing.T) {
-	_, err := resolveChannelID("token", "@nonexistent_localhost_xyz_12345")
+	_, err := resolveChannelID("token", "@nonexistent_localhost_xyz_12345", "", "")
 	if err == nil {
 		t.Fatal("expected error for unreachable host")
 	}
