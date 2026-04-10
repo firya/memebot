@@ -27,8 +27,15 @@ func (m channelMsg) MessageSig() (string, int64) {
 
 // resolveChannelID calls getChat to obtain the numeric ID for a channel username.
 func resolveChannelID(token, username string) (int64, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getChat?chat_id=%s", token, username)
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(url)
+	return resolveChannelIDURL(
+		fmt.Sprintf("https://api.telegram.org/bot%s/getChat?chat_id=%s", token, username),
+	)
+}
+
+// resolveChannelIDURL fetches and decodes a getChat response from the given URL.
+// Separated from resolveChannelID so tests can inject a mock server URL.
+func resolveChannelIDURL(rawURL string) (int64, error) {
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(rawURL)
 	if err != nil {
 		return 0, fmt.Errorf("getChat request: %w", err)
 	}

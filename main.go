@@ -40,7 +40,14 @@ func main() {
 	var workerQuotaUntil atomic.Int64
 	var workerIntervalNs atomic.Int64
 	workerIntervalNs.Store(int64(workerIntervalEconom))
-	go runWorker(bot, db, cfg, jobChan, workerWake, &workerQuotaUntil, &workerIntervalNs)
+
+	hashes, err := loadHashes(db)
+	if err != nil {
+		log.Fatalf("load image hashes: %v", err)
+	}
+	log.Printf("loaded %d image hashes into memory", len(hashes))
+
+	go runWorker(bot, db, cfg, jobChan, workerWake, &workerQuotaUntil, &workerIntervalNs, &hashes)
 
 	// Re-queue any jobs that permanently failed in a previous session.
 	{

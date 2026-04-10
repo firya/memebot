@@ -40,7 +40,7 @@ func sendAdminAlert(bot *tele.Bot, adminID int64, msg string) {
 // sleeps due to daily quota exhaustion, and reset to 0 when it resumes.
 // intervalNs holds the current ticker interval in nanoseconds; writing to it
 // causes the worker to reset its ticker on the next iteration.
-func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}, quotaUntil *atomic.Int64, intervalNs *atomic.Int64) {
+func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wake <-chan struct{}, quotaUntil *atomic.Int64, intervalNs *atomic.Int64, hashes *[]uint64) {
 	currentInterval := workerIntervalEconom
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
@@ -76,17 +76,17 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 			continue
 		}
 
-		// Perceptual dedup: skip images that look identical to already-indexed ones.
+		// Compute perceptual hash once; reused for both dedup check and storage.
+		var imgHash uint64
 		if job.replyTo == 0 {
-			hash := computeDHash(imageBytes)
-			dup, err := isDuplicateImage(db, hash)
-			if err != nil {
-				log.Printf("worker: phash check error msg_id=%d: %v", job.msgID, err)
-			} else if dup {
+			imgHash = computeDHash(imageBytes)
+			if isDuplicate(*hashes, imgHash) {
 				log.Printf("worker: msg_id=%d is a visual duplicate, skipping", job.msgID)
 				// Mark as indexed so the crawler doesn't revisit it.
-				if err := storeImageHash(db, hash); err != nil {
+				if err := storeImageHash(db, imgHash); err != nil {
 					log.Printf("worker: store dup hash error msg_id=%d: %v", job.msgID, err)
+				} else {
+					*hashes = append(*hashes, imgHash)
 				}
 				if _, err := db.Exec("INSERT OR IGNORE INTO indexed_msgs(msg_id) VALUES (?)", job.msgID); err != nil {
 					log.Printf("worker: mark dup indexed error msg_id=%d: %v", job.msgID, err)
@@ -163,8 +163,10 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 
 		// Store perceptual hash so future duplicates are detected.
 		if job.replyTo == 0 {
-			if err := storeImageHash(db, computeDHash(imageBytes)); err != nil {
+			if err := storeImageHash(db, imgHash); err != nil {
 				log.Printf("worker: store phash error msg_id=%d: %v", job.msgID, err)
+			} else if imgHash != 0 {
+				*hashes = append(*hashes, imgHash)
 			}
 			// Remove from failed_msgs if this was a previously failed job.
 			if _, err := db.Exec("DELETE FROM failed_msgs WHERE msg_id = ?", job.msgID); err != nil {

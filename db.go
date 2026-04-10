@@ -66,20 +66,21 @@ func initDB(path string) (*sql.DB, error) {
 }
 
 func resetDB(db *sql.DB) error {
-	_, err := db.Exec(`
-		DELETE FROM memes;
-		DELETE FROM indexed_msgs;
-		DELETE FROM crawler_state;
-		DELETE FROM image_hashes;
-		DELETE FROM failed_msgs;
-	`)
-	return err
+	for _, table := range []string{"memes", "indexed_msgs", "crawler_state", "image_hashes", "failed_msgs"} {
+		if _, err := db.Exec("DELETE FROM " + table); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func isAlreadyIndexed(db *sql.DB, msgID int) (bool, error) {
 	var n int
-	err := db.QueryRow("SELECT COUNT(*) FROM indexed_msgs WHERE msg_id = ?", msgID).Scan(&n)
-	return n > 0, err
+	err := db.QueryRow("SELECT 1 FROM indexed_msgs WHERE msg_id = ? LIMIT 1", msgID).Scan(&n)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func saveMeme(db *sql.DB, fileID string, msgID int, originalDesc string) error {
@@ -105,6 +106,16 @@ func saveMeme(db *sql.DB, fileID string, msgID int, originalDesc string) error {
 	return tx.Commit()
 }
 
+// truncateCaption safely trims s to at most 1024 Unicode code points (Telegram caption limit).
+func truncateCaption(s string) string {
+	const limit = 1024
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit-3]) + "..."
+}
+
 func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
 	rows, err := db.Query(
 		`SELECT file_id, rowid, original_desc FROM memes WHERE search_vector MATCH ? ORDER BY rank LIMIT 50`,
@@ -122,14 +133,10 @@ func searchMemes(db *sql.DB, ftsQuery string) ([]tele.Result, error) {
 		if err := rows.Scan(&fileID, &rowid, &originalDesc); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		// Telegram caption limit is 1024 characters
-		if len(originalDesc) > 1024 {
-			originalDesc = originalDesc[:1021] + "..."
-		}
 		results = append(results, &tele.PhotoResult{
 			ResultBase: tele.ResultBase{ID: strconv.FormatInt(rowid, 10)},
 			Cache:      fileID,
-			Caption:    originalDesc,
+			Caption:    truncateCaption(originalDesc),
 		})
 	}
 
@@ -173,8 +180,8 @@ func computeDHash(imgBytes []byte) uint64 {
 
 	// Sample a cols×rows grid using nearest-neighbour and convert to grayscale.
 	var grid [rows][cols]uint8
-	for y := 0; y < rows; y++ {
-		for x := 0; x < cols; x++ {
+	for y := range rows {
+		for x := range cols {
 			sx := bounds.Min.X + x*srcW/cols
 			sy := bounds.Min.Y + y*srcH/rows
 			r, g, b, _ := img.At(sx, sy).RGBA()
@@ -184,8 +191,8 @@ func computeDHash(imgBytes []byte) uint64 {
 
 	// Each bit: 1 if left pixel is brighter than right neighbour.
 	var hash uint64
-	for y := 0; y < rows; y++ {
-		for x := 0; x < cols-1; x++ {
+	for y := range rows {
+		for x := range cols - 1 {
 			if grid[y][x] > grid[y][x+1] {
 				hash |= 1 << uint(y*(cols-1)+x)
 			}
@@ -194,27 +201,38 @@ func computeDHash(imgBytes []byte) uint64 {
 	return hash
 }
 
-// isDuplicateImage returns true when an image with a Hamming distance ≤ dHashThreshold
-// already exists in image_hashes.
-func isDuplicateImage(db *sql.DB, hash uint64) (bool, error) {
-	if hash == 0 {
-		return false, nil
-	}
+// loadHashes reads all perceptual hashes from the DB into a slice for
+// in-memory duplicate detection. Call once at startup and pass the slice
+// to the worker so every check avoids a round-trip to SQLite.
+func loadHashes(db *sql.DB) ([]uint64, error) {
 	rows, err := db.Query("SELECT phash FROM image_hashes")
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer rows.Close()
+	var hashes []uint64
 	for rows.Next() {
-		var stored uint64
-		if err := rows.Scan(&stored); err != nil {
-			return false, err
+		var h uint64
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
 		}
+		hashes = append(hashes, h)
+	}
+	return hashes, rows.Err()
+}
+
+// isDuplicate returns true when hash is within dHashThreshold Hamming distance
+// of any hash in the supplied slice. O(n) in-memory scan; no DB access.
+func isDuplicate(hashes []uint64, hash uint64) bool {
+	if hash == 0 {
+		return false
+	}
+	for _, stored := range hashes {
 		if bits.OnesCount64(hash^stored) <= dHashThreshold {
-			return true, nil
+			return true
 		}
 	}
-	return false, rows.Err()
+	return false
 }
 
 // storeImageHash saves a perceptual hash so future duplicates are detected.

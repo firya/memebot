@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+const geminiModel = "gemini-2.0-flash-lite"
+
+// Package-level HTTP clients with connection pooling. Creating a new client
+// per request forgoes keep-alive connections and wastes sockets.
+var (
+	tgAPIClient      = &http.Client{Timeout: 15 * time.Second}
+	tgDownloadClient = &http.Client{Timeout: 60 * time.Second}
+	geminiHTTPClient = &http.Client{Timeout: 30 * time.Second}
+)
+
 // errQuotaExceeded is returned by callGemini when the daily API quota is exhausted.
 // The worker must not retry such requests — the quota resets at midnight UTC.
 var errQuotaExceeded = errors.New("gemini daily quota exceeded")
@@ -40,7 +50,7 @@ const aiPrompt = `Проанализируй мем или комикс и от�
 // fetchImageBytes resolves a Telegram file_id to raw image bytes and MIME type.
 func fetchImageBytes(cfg Config, fileID string) ([]byte, string, error) {
 	tgFileURL := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", cfg.TelegramToken, fileID)
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(tgFileURL)
+	resp, err := tgAPIClient.Get(tgFileURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("getFile request: %w", err)
 	}
@@ -61,7 +71,7 @@ func fetchImageBytes(cfg Config, fileID string) ([]byte, string, error) {
 	}
 
 	imageURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", cfg.TelegramToken, fileInfo.Result.FilePath)
-	imgResp, err := (&http.Client{Timeout: 60 * time.Second}).Get(imageURL)
+	imgResp, err := tgDownloadClient.Get(imageURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("download image: %w", err)
 	}
@@ -113,7 +123,7 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 	if workerURL != "" {
 		base = workerURL
 	}
-	endpoint := base + "/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=" + apiKey
+	endpoint := base + "/v1beta/models/" + geminiModel + ":generateContent?key=" + apiKey
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", fmt.Errorf("create gemini request: %w", err)
@@ -123,7 +133,7 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 		req.Header.Set("X-Worker-Secret", workerSecret)
 	}
 
-	geminiResp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	geminiResp, err := geminiHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("gemini HTTP request: %w", err)
 	}

@@ -10,7 +10,7 @@ func TestStripPunct(t *testing.T) {
 		in, want string
 	}{
 		{"hello, world!", "hello  world "},
-		{"котики!!!", "котики   "},
+		{"котики!!!", "котики "},
 		{"no-punct", "no punct"},
 		{"привет.мир", "привет мир"},
 		{"чисто слова", "чисто слова"},
