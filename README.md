@@ -63,7 +63,7 @@ make logs   # смотреть логи
 
 Ключ: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 
-Используется модель `gemini-2.0-flash-lite`. Gemini идентифицирует известных людей на фото.
+Используется модель `gemini-3.1-flash-lite-preview`. Gemini идентифицирует известных людей на фото.
 
 **Лимиты (бесплатный тариф):**
 - 15 RPM, 500 RPD — воркер работает в режиме `/econom` по умолчанию

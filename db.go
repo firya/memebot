@@ -105,26 +105,15 @@ func saveMeme(db *sql.DB, fileID string, msgID int, originalDesc string) error {
 	return tx.Commit()
 }
 
-// truncateCaption safely trims s to at most 1024 Unicode code points (Telegram caption limit).
-func truncateCaption(s string) string {
-	const limit = 1024
-	runes := []rune(s)
-	if len(runes) <= limit {
-		return s
-	}
-	return string(runes[:limit-3]) + "..."
-}
-
 // MemeResult holds the data for a single inline query result.
 type MemeResult struct {
-	FileID  string
-	Rowid   int64
-	Caption string
+	FileID string
+	Rowid  int64
 }
 
 func searchMemes(db *sql.DB, ftsQuery string) ([]MemeResult, error) {
 	rows, err := db.Query(
-		`SELECT file_id, rowid, original_desc FROM memes WHERE search_vector MATCH ? ORDER BY rank LIMIT 50`,
+		`SELECT file_id, rowid FROM memes WHERE search_vector MATCH ? ORDER BY rank LIMIT 50`,
 		ftsQuery,
 	)
 	if err != nil {
@@ -134,16 +123,12 @@ func searchMemes(db *sql.DB, ftsQuery string) ([]MemeResult, error) {
 
 	var results []MemeResult
 	for rows.Next() {
-		var fileID, originalDesc string
+		var fileID string
 		var rowid int64
-		if err := rows.Scan(&fileID, &rowid, &originalDesc); err != nil {
+		if err := rows.Scan(&fileID, &rowid); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		results = append(results, MemeResult{
-			FileID:  fileID,
-			Rowid:   rowid,
-			Caption: truncateCaption(originalDesc),
-		})
+		results = append(results, MemeResult{FileID: fileID, Rowid: rowid})
 	}
 
 	return results, rows.Err()

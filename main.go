@@ -214,7 +214,6 @@ func main() {
 		Type        string `json:"type"`
 		ID          string `json:"id"`
 		PhotoFileID string `json:"photo_file_id"`
-		Caption     string `json:"caption,omitempty"`
 	}
 	type inlineAnswer struct {
 		QueryID   string              `json:"inline_query_id"`
@@ -232,7 +231,6 @@ func main() {
 				Type:        "photo",
 				ID:          strconv.FormatInt(m.Rowid, 10),
 				PhotoFileID: m.FileID,
-				Caption:     m.Caption,
 			}
 		}
 		_, err := c.Bot().Raw("answerInlineQuery", resp)

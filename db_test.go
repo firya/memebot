@@ -7,7 +7,6 @@ import (
 	"image/color"
 	"image/png"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -60,49 +59,6 @@ func makeGradientPNG(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
-// ── truncateCaption ───────────────────────────────────────────────────────────
-
-func TestTruncateCaption(t *testing.T) {
-	// Short string unchanged.
-	s := "привет мир"
-	if got := truncateCaption(s); got != s {
-		t.Errorf("truncateCaption short: got %q, want %q", got, s)
-	}
-
-	// Exactly 1024 runes — unchanged.
-	long := strings.Repeat("а", 1024)
-	if got := truncateCaption(long); got != long {
-		t.Errorf("truncateCaption 1024 runes: got len %d, want %d", len([]rune(got)), 1024)
-	}
-
-	// 1025 runes — must be truncated to ≤ 1024 runes and end with "...".
-	over := strings.Repeat("б", 1025)
-	got := truncateCaption(over)
-	runes := []rune(got)
-	if len(runes) > 1024 {
-		t.Errorf("truncateCaption over 1024: len=%d, want ≤1024", len(runes))
-	}
-	if !strings.HasSuffix(got, "...") {
-		t.Errorf("truncateCaption over 1024: %q does not end with ...", got)
-	}
-
-	// Multi-byte sequence is not split — result must be valid UTF-8.
-	// "я" is a 2-byte UTF-8 sequence; 1025 of them = 2050 bytes.
-	mb := strings.Repeat("я", 1025)
-	gotMB := truncateCaption(mb)
-	if !isValidUTF8(gotMB) {
-		t.Errorf("truncateCaption produced invalid UTF-8: %q", gotMB)
-	}
-}
-
-func isValidUTF8(s string) bool {
-	for _, r := range s {
-		if r == '\uFFFD' {
-			return false
-		}
-	}
-	return true
-}
 
 // ── crawler state ─────────────────────────────────────────────────────────────
 
