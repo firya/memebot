@@ -28,6 +28,7 @@ func (t *workerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func main() {
 	cfg := loadConfig()
+	log.Printf("Gemini model: %s", cfg.GeminiModel)
 
 	db, err := initDB(cfg.DBPath)
 	if err != nil {
@@ -286,9 +287,9 @@ func main() {
 			"`/reset <n>` — сбросить БД и проиндексировать первые N фото (dev)\n\n" +
 			"*Воркер / AI:*\n" +
 			"`/analyze` — разбудить воркер досрочно, если он спит из-за RPM-лимита\n" +
-			"_(при дневном лимите Gemini не поможет — квота сбросится в 00:05 UTC)_\n" +
-			"`/boost` — платный тариф (4000 RPM / 150000 RPD)\n" +
-			"`/econom` — бесплатный тариф (15 RPM / 500 RPD)\n\n" +
+			"_(при дневном лимите Gemini не поможет — квота сбросится в 00:05 по тихоокеанскому времени США)_\n" +
+			"`/boost` — ускорить очередь (тариф и квоты Google не меняет)\n" +
+			"`/econom` — обычная скорость: один запрос в 4 с\n\n" +
 			"*Поиск:*\n" +
 			"Inline-поиск работает везде: `@botusername запрос`\n" +
 			"Бот понимает русский язык со стеммингом — достаточно части слова" +
@@ -303,7 +304,7 @@ func main() {
 		select {
 		case workerWake <- struct{}{}:
 			log.Println("admin /analyze: woke worker")
-			return c.Send("⚡ Сигнал отправлен. Если воркер спит из-за RPM-лимита — проснётся сразу.\n\nЕсли сработал дневной лимит Gemini — /analyze не поможет, квота сбросится автоматически в 00:05 UTC.")
+			return c.Send("⚡ Сигнал отправлен. Если воркер спит из-за RPM-лимита — проснётся сразу.\n\nЕсли сработал дневной лимит Gemini — /analyze не поможет, квота сбросится автоматически в 00:05 по тихоокеанскому времени США.")
 		default:
 			return c.Send("ℹ️ Воркер не спит (сигнал уже в очереди или таймаут не активен).")
 		}
@@ -343,7 +344,7 @@ func main() {
 			return nil
 		}
 		workerIntervalNs.Store(int64(workerIntervalBoost))
-		return c.Send("⚡ Boost mode: 4000 RPM / 150000 RPD (15 мс/запрос). Вернуть: /econom")
+		return c.Send("⚡ Boost mode: 15 мс/запрос. Тариф и квоты Google не меняются. Вернуть: /econom")
 	})
 
 	bot.Handle("/econom", func(c tele.Context) error {
@@ -351,7 +352,7 @@ func main() {
 			return nil
 		}
 		workerIntervalNs.Store(int64(workerIntervalEconom))
-		return c.Send("🐢 Econom mode: 15 RPM / 500 RPD (4000 мс/запрос).")
+		return c.Send("🐢 Econom mode: один запрос в 4 с. Квоты зависят от модели и проекта Google.")
 	})
 
 	bot.Handle("/reset", func(c tele.Context) error {

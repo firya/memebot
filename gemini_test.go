@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // geminiResponse is a helper to build a minimal Gemini JSON response.
@@ -41,7 +42,7 @@ func TestCallGemini_Success(t *testing.T) {
 	srv := serveJSON(t, 200, geminiResponse("  кот сидит  "))
 	defer srv.Close()
 
-	got, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	got, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -54,7 +55,7 @@ func TestCallGemini_RateLimited_429WithRetryAfter(t *testing.T) {
 	srv := serveJSON(t, 429, map[string]any{}, map[string]string{"Retry-After": "30"})
 	defer srv.Close()
 
-	_, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if !errors.Is(err, errRateLimited) {
 		t.Errorf("expected errRateLimited, got %v", err)
 	}
@@ -64,7 +65,7 @@ func TestCallGemini_QuotaExceeded_429NoRetryAfter(t *testing.T) {
 	srv := serveJSON(t, 429, map[string]any{})
 	defer srv.Close()
 
-	_, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if !errors.Is(err, errQuotaExceeded) {
 		t.Errorf("expected errQuotaExceeded, got %v", err)
 	}
@@ -77,7 +78,7 @@ func TestCallGemini_APIErrorWithQuota(t *testing.T) {
 	srv := serveJSON(t, 200, body)
 	defer srv.Close()
 
-	_, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if !errors.Is(err, errQuotaExceeded) {
 		t.Errorf("expected errQuotaExceeded, got %v", err)
 	}
@@ -90,7 +91,7 @@ func TestCallGemini_APIErrorWithRetryAfter(t *testing.T) {
 	srv := serveJSON(t, 429, body, map[string]string{"Retry-After": "60"})
 	defer srv.Close()
 
-	_, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if !errors.Is(err, errRateLimited) {
 		t.Errorf("expected errRateLimited, got %v", err)
 	}
@@ -103,7 +104,7 @@ func TestCallGemini_GenericAPIError(t *testing.T) {
 	srv := serveJSON(t, 500, body)
 	defer srv.Close()
 
-	_, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -116,7 +117,7 @@ func TestCallGemini_EmptyResponse(t *testing.T) {
 	srv := serveJSON(t, 200, map[string]any{"candidates": []any{}})
 	defer srv.Close()
 
-	_, err := callGemini("key", srv.URL, "", []byte("img"), "image/jpeg")
+	_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
 	if err == nil {
 		t.Fatal("expected error for empty candidates, got nil")
 	}
@@ -131,9 +132,60 @@ func TestCallGemini_WorkerSecret(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	callGemini("key", srv.URL, "mysecret", []byte("img"), "image/jpeg")
+	callGemini("key", srv.URL, "mysecret", "", []byte("img"), "image/jpeg")
 	if gotSecret != "mysecret" {
 		t.Errorf("X-Worker-Secret: got %q, want %q", gotSecret, "mysecret")
+	}
+}
+
+func TestCallGemini_ModelAndKeyHeader(t *testing.T) {
+	for _, model := range []string{"", "gemini-3.5-flash-lite"} {
+		t.Run(model, func(t *testing.T) {
+			wantModel := model
+			if wantModel == "" {
+				wantModel = defaultGeminiModel
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1beta/models/"+wantModel+":generateContent" {
+					t.Errorf("unexpected model path: %s", r.URL.Path)
+				}
+				if r.Header.Get("x-goog-api-key") != "test-key" || r.URL.RawQuery != "" {
+					t.Error("API key must be sent in its header, never in the URL")
+				}
+				json.NewEncoder(w).Encode(geminiResponse("ok"))
+			}))
+			defer srv.Close()
+			_, err := callGemini("test-key", srv.URL+"/", "", model, []byte("img"), "image/jpeg")
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCallGemini_BillingFailureIsNotQuota(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusTooManyRequests} {
+		srv := serveJSON(t, status, map[string]any{
+			"error": map[string]string{"message": "Your prepayment credits are depleted. Please go to AI Studio to manage your project and billing."},
+		}, map[string]string{"Retry-After": "30"})
+		_, err := callGemini("key", srv.URL, "", "", []byte("img"), "image/jpeg")
+		srv.Close()
+		if !errors.Is(err, errBillingUnavailable) || errors.Is(err, errQuotaExceeded) || errors.Is(err, errRateLimited) {
+			t.Errorf("status %d: expected a billing failure, got %v", status, err)
+		}
+	}
+}
+
+func TestNextGeminiQuotaReset(t *testing.T) {
+	for _, tc := range []struct{ now, want string }{
+		{"2026-10-29T06:30:00Z", "2026-10-29T07:05:00Z"},
+		{"2026-10-29T08:00:00Z", "2026-10-30T07:05:00Z"},
+		{"2026-11-01T07:30:00Z", "2026-11-02T08:05:00Z"},
+	} {
+		now, _ := time.Parse(time.RFC3339, tc.now)
+		if got := nextGeminiQuotaReset(now).UTC().Format(time.RFC3339); got != tc.want {
+			t.Errorf("reset at %s = %s, want %s", tc.now, got, tc.want)
+		}
 	}
 }
 

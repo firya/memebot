@@ -63,14 +63,18 @@ make logs   # смотреть логи
 
 Ключ: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 
-Используется модель `gemini-3.1-flash-lite-preview`. Gemini идентифицирует известных людей на фото.
+Используется модель `gemini-3.8-flash`. Gemini идентифицирует известных людей на фото.
+
+Модель задаётся через `GEMINI_MODEL` (по умолчанию `gemini-3.8-flash`). Для бесплатной работы отключите биллинг именно у проекта ключа в Google Cloud: бесплатная цена модели не распространяется на запросы платного проекта. Если Google пишет `prepayment credits are depleted`, автоматического возврата на Free Tier нет. Короткие повторы при этой ошибке отключены, картинки сохраняются в `failed_msgs` и повторно ставятся в очередь после перезапуска.
+
+Документация: [Billing](https://ai.google.dev/gemini-api/docs/billing) и [Pricing](https://ai.google.dev/gemini-api/docs/pricing).
 
 **Лимиты (бесплатный тариф):**
-- 15 RPM, 500 RPD — воркер работает в режиме `/econom` по умолчанию
+- Лимиты зависят от модели и проекта; см. Rate Limit в AI Studio. `/econom` ограничивает отправку до одного запроса в 4 секунды.
 - При превышении RPM — воркер делает паузу 60 с и продолжает
-- При исчерпании дневной квоты — воркер спит до 00:05 UTC следующего дня
+- При исчерпании дневной квоты — воркер спит до 00:05 следующего дня по тихоокеанскому времени США
 
-**Платный тариф:** после апгрейда переключи `/boost` (4000 RPM / 150000 RPD).
+`/boost` меняет только локальную скорость запросов; он не включает тариф и не увеличивает квоты Google.
 
 **Если Gemini заблокирован в твоём регионе** (например, сервер в Нидерландах) — используй Cloudflare Worker как прокси (см. ниже).
 
@@ -106,7 +110,7 @@ GEMINI_WORKER_SECRET=твой-секрет
 curl -s -o /dev/null -w "%{http_code}" https://ИМЯ.АККАУНТ.workers.dev
 
 # Полная проверка с ключом и секретом (одна строка)
-curl -s -X POST "https://ИМЯ.АККАУНТ.workers.dev/v1beta/models/gemini-2.0-flash-lite:generateContent?key=GEMINI_API_KEY" \
+curl -s -X POST "https://ИМЯ.АККАУНТ.workers.dev/v1beta/models/gemini-3.8-flash:generateContent?key=GEMINI_API_KEY" \
   -H "Content-Type: application/json" \
   -H "X-Worker-Secret: WORKER_SECRET" \
   -d '{"contents":[{"parts":[{"text":"скажи привет"}]}]}' | jq .candidates[0].content.parts[0].text
@@ -135,8 +139,8 @@ make db        — статистика БД (кол-во мемов, после
 | `/reset <n>` | dev | Сбросить БД и проиндексировать первые N фото |
 | `/index <n>` | dev | Алиас для `/reset <n>` |
 | `/analyze` | dev + prod | Разбудить воркер досрочно при RPM-лимите |
-| `/boost` | dev + prod | Платный тариф: 4000 RPM / 150000 RPD |
-| `/econom` | dev + prod | Бесплатный тариф: 15 RPM / 500 RPD (по умолчанию) |
+| `/boost` | dev + prod | Интервал 15 мс; квоты Google не увеличивает |
+| `/econom` | dev + prod | Интервал 4 с (по умолчанию) |
 
 Бот также принимает **фото в личку** от администратора — анализирует через Gemini и отвечает описанием (без сохранения в БД).
 
@@ -156,6 +160,7 @@ make db        — статистика БД (кол-во мемов, после
 |---|---|---|---|
 | `TELEGRAM_TOKEN` | да | — | Токен бота |
 | `GEMINI_API_KEY` | да | — | API-ключ Google Gemini |
+| `GEMINI_MODEL` | нет | `gemini-3.8-flash` | Модель Gemini с поддержкой изображений |
 | `GEMINI_WORKER_URL` | нет | — | URL Cloudflare Worker для Gemini |
 | `GEMINI_WORKER_SECRET` | нет | — | Секрет для аутентификации Worker |
 | `CHANNEL_USERNAME` | да | — | Username канала с `@` |

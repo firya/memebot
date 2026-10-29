@@ -13,23 +13,27 @@ import (
 	"time"
 )
 
-const geminiModel = "gemini-3.5-flash"
+const defaultGeminiModel = "gemini-3.8-flash"
 
 // Package-level HTTP clients with connection pooling. Creating a new client
 // per request forgoes keep-alive connections and wastes sockets.
 var (
 	tgAPIClient      = &http.Client{Timeout: 15 * time.Second}
 	tgDownloadClient = &http.Client{Timeout: 60 * time.Second}
-	geminiHTTPClient = &http.Client{Timeout: 30 * time.Second}
+	geminiHTTPClient = &http.Client{Timeout: 60 * time.Second}
 )
 
 // errQuotaExceeded is returned by callGemini when the daily API quota is exhausted.
-// The worker must not retry such requests — the quota resets at midnight UTC.
+// The worker must wait for the daily quota reset at midnight Pacific time.
 var errQuotaExceeded = errors.New("gemini daily quota exceeded")
 
 // errRateLimited is returned by callGemini when the per-minute rate limit is hit.
 // The worker should pause ~60 s and retry, NOT sleep until midnight.
 var errRateLimited = errors.New("gemini rate limited (RPM)")
+
+// A billing failure will not recover through short retries or a quota reset.
+// Restore Free Tier on the Google project; never fall back to a paid model.
+var errBillingUnavailable = errors.New("gemini billing unavailable: disable billing on the API key's Google project to return to Free Tier")
 
 const aiPrompt = `Проанализируй мем или комикс и ответь в трёх частях:
 
@@ -118,7 +122,10 @@ func fetchImageBytes(cfg Config, fileID string) ([]byte, string, error) {
 // callGemini sends imageBytes to the Gemini vision API and returns the description.
 // workerURL overrides the googleapis.com base URL (Cloudflare Worker); empty means direct.
 // workerSecret is sent as X-Worker-Secret if set.
-func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeType string) (string, error) {
+func callGemini(apiKey, workerURL, workerSecret, model string, imageBytes []byte, mimeType string) (string, error) {
+	if model == "" {
+		model = defaultGeminiModel
+	}
 	reqBody := struct {
 		Contents []struct {
 			Parts []any `json:"parts"`
@@ -143,12 +150,13 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 	if workerURL != "" {
 		base = workerURL
 	}
-	endpoint := base + "/v1beta/models/" + geminiModel + ":generateContent?key=" + apiKey
+	endpoint := strings.TrimRight(base, "/") + "/v1beta/models/" + model + ":generateContent"
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", fmt.Errorf("create gemini request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", apiKey)
 	if workerSecret != "" {
 		req.Header.Set("X-Worker-Secret", workerSecret)
 	}
@@ -184,6 +192,9 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 	if result.Error != nil {
 		msg := result.Error.Message
 		msgLower := strings.ToLower(msg)
+		if strings.Contains(msgLower, "prepayment credits") || strings.Contains(msgLower, "prepay") || strings.Contains(msgLower, "billing account") {
+			return "", errBillingUnavailable
+		}
 		if geminiResp.StatusCode == 429 || strings.Contains(msgLower, "quota") || strings.Contains(msg, "RESOURCE_EXHAUSTED") {
 			log.Printf("gemini quota/rate error (status=%d, retry-after=%q): %s", geminiResp.StatusCode, geminiResp.Header.Get("Retry-After"), msg)
 			// Retry-After present → per-minute RPM limit; absent → daily quota exhausted.
@@ -209,5 +220,5 @@ func callGemini(apiKey, workerURL, workerSecret string, imageBytes []byte, mimeT
 
 // describeImageFromBytes sends pre-fetched image bytes to Gemini.
 func describeImageFromBytes(cfg Config, imageBytes []byte, mimeType string) (string, error) {
-	return callGemini(cfg.GeminiAPIKey, cfg.GeminiWorkerURL, cfg.GeminiWorkerSecret, imageBytes, mimeType)
+	return callGemini(cfg.GeminiAPIKey, cfg.GeminiWorkerURL, cfg.GeminiWorkerSecret, cfg.GeminiModel, imageBytes, mimeType)
 }

@@ -4,21 +4,23 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
-	TelegramToken         string
-	TelegramAPIURL        string // Cloudflare Worker URL (replaces direct api.telegram.org)
-	TelegramWorkerSecret  string // X-Worker-Secret header value for Telegram worker
-	GeminiAPIKey          string
-	GeminiWorkerURL       string // Cloudflare Worker URL (replaces direct googleapis.com call)
-	GeminiWorkerSecret    string // X-Worker-Secret header value
-	ChannelUsername       string // e.g. "@mychannel"
-	DumpChatID            int64
-	AdminID               int64
-	DBPath                string
-	DevMode               bool // APP_ENV=dev
-	CrawlerMaxGap         int  // consecutive misses before history is considered exhausted
+	TelegramToken        string
+	TelegramAPIURL       string // Cloudflare Worker URL (replaces direct api.telegram.org)
+	TelegramWorkerSecret string // X-Worker-Secret header value for Telegram worker
+	GeminiAPIKey         string
+	GeminiModel          string // model ID, defaults to the current stable Flash model
+	GeminiWorkerURL      string // Cloudflare Worker URL (replaces direct googleapis.com call)
+	GeminiWorkerSecret   string // X-Worker-Secret header value
+	ChannelUsername      string // e.g. "@mychannel"
+	DumpChatID           int64
+	AdminID              int64
+	DBPath               string
+	DevMode              bool // APP_ENV=dev
+	CrawlerMaxGap        int  // consecutive misses before history is considered exhausted
 }
 
 func loadConfig() Config {
@@ -46,6 +48,10 @@ func loadConfig() Config {
 	}
 
 	devMode := os.Getenv("APP_ENV") == "dev"
+	geminiModel := strings.TrimSpace(os.Getenv("GEMINI_MODEL"))
+	if geminiModel == "" {
+		geminiModel = defaultGeminiModel
+	}
 
 	crawlerMaxGap := 100
 	if v := os.Getenv("CRAWLER_MAX_GAP"); v != "" {
@@ -59,6 +65,7 @@ func loadConfig() Config {
 		TelegramAPIURL:       os.Getenv("TELEGRAM_API_URL"),
 		TelegramWorkerSecret: os.Getenv("TELEGRAM_WORKER_SECRET"),
 		GeminiAPIKey:         must("GEMINI_API_KEY"),
+		GeminiModel:          geminiModel,
 		GeminiWorkerURL:      os.Getenv("GEMINI_WORKER_URL"),
 		GeminiWorkerSecret:   os.Getenv("GEMINI_WORKER_SECRET"),
 		ChannelUsername:      must("CHANNEL_USERNAME"),

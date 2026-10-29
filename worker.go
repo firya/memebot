@@ -22,8 +22,8 @@ type indexJob struct {
 // workerIntervalEconom and workerIntervalBoost define the request cadence
 // for the two rate-limit modes selectable via /econom and /boost.
 const (
-	workerIntervalEconom = 4000 * time.Millisecond // 15 RPM / 500 RPD (free tier)
-	workerIntervalBoost  = 15 * time.Millisecond   // 4000 RPM / 150000 RPD (paid tier)
+	workerIntervalEconom = 4000 * time.Millisecond // local pacing; actual free limits depend on project/model
+	workerIntervalBoost  = 15 * time.Millisecond   // changes local pacing only, not the Google tier
 )
 
 func sendAdminAlert(bot *tele.Bot, adminID int64, msg string) {
@@ -126,9 +126,8 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 				continue
 			}
 			if errors.Is(err, errQuotaExceeded) {
-				// Daily quota exhausted — pause until next midnight UTC (interruptible by /analyze).
-				now := time.Now().UTC()
-				nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, time.UTC)
+				// Google resets daily quotas at midnight Pacific time.
+				nextMidnight := nextGeminiQuotaReset(time.Now()).UTC()
 				waitDur := time.Until(nextMidnight)
 				alertMsg := fmt.Sprintf("Gemini daily quota exhausted. Worker paused until %s UTC (~%s). Квота сбросится автоматически.", nextMidnight.Format("2006-01-02 15:04"), waitDur.Round(time.Minute))
 				log.Println("worker:", alertMsg)
@@ -145,7 +144,7 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 				continue
 			}
 			const maxRetries = 3
-			if job.replyTo == 0 && job.retries < maxRetries {
+			if job.replyTo == 0 && job.retries < maxRetries && !errors.Is(err, errBillingUnavailable) {
 				job.retries++
 				delay := time.Duration(job.retries*30) * time.Second
 				log.Printf("worker: AI error msg_id=%d, retry %d/%d in %s: %v", job.msgID, job.retries, maxRetries, delay, err)
@@ -216,4 +215,14 @@ func runWorker(bot *tele.Bot, db *sql.DB, cfg Config, jobChan chan indexJob, wak
 			}
 		}
 	}
+}
+
+func nextGeminiQuotaReset(now time.Time) time.Time {
+	pacific, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		// The runtime image includes tzdata; retain a conservative fallback.
+		return now.Add(24 * time.Hour)
+	}
+	now = now.In(pacific)
+	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, pacific)
 }
