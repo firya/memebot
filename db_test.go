@@ -271,3 +271,25 @@ func TestLoadHashesAndStore(t *testing.T) {
 		t.Errorf("loadHashes: got %x, want DEADBEEF", hashes[0])
 	}
 }
+
+func TestStoreImageHashHighBitRoundTrip(t *testing.T) {
+	db := testDB(t)
+	want := []uint64{1, 1<<63 - 1, 1 << 63, 0xffffffffffffffff}
+	for _, hash := range want {
+		if err := storeImageHash(db, hash); err != nil {
+			t.Fatalf("storeImageHash(%016x): %v", hash, err)
+		}
+	}
+	got, err := loadHashes(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("loaded %d hashes, want %d", len(got), len(want))
+	}
+	for i, hash := range want {
+		if got[i] != hash || !isDuplicate(got, hash) {
+			t.Errorf("hash %016x did not survive storage: %016x", hash, got[i])
+		}
+	}
+}

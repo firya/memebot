@@ -203,11 +203,11 @@ func loadHashes(db *sql.DB) ([]uint64, error) {
 	defer rows.Close()
 	var hashes []uint64
 	for rows.Next() {
-		var h uint64
+		var h int64
 		if err := rows.Scan(&h); err != nil {
 			return nil, err
 		}
-		hashes = append(hashes, h)
+		hashes = append(hashes, uint64(h))
 	}
 	return hashes, rows.Err()
 }
@@ -231,6 +231,7 @@ func storeImageHash(db *sql.DB, hash uint64) error {
 	if hash == 0 {
 		return nil
 	}
-	_, err := db.Exec("INSERT INTO image_hashes(phash) VALUES (?)", hash)
+	// SQLite INTEGER is signed; converting both ways preserves all 64 hash bits.
+	_, err := db.Exec("INSERT INTO image_hashes(phash) VALUES (?)", int64(hash))
 	return err
 }
