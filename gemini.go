@@ -20,7 +20,7 @@ const defaultGeminiModel = "gemini-3.8-flash"
 var (
 	tgAPIClient      = &http.Client{Timeout: 15 * time.Second}
 	tgDownloadClient = &http.Client{Timeout: 60 * time.Second}
-	geminiHTTPClient = &http.Client{Timeout: 60 * time.Second}
+	geminiHTTPClient = &http.Client{Timeout: 120 * time.Second}
 )
 
 // errQuotaExceeded is returned by callGemini when the daily API quota is exhausted.
@@ -130,6 +130,7 @@ func callGemini(apiKey, workerURL, workerSecret, model string, imageBytes []byte
 		Contents []struct {
 			Parts []any `json:"parts"`
 		} `json:"contents"`
+		GenerationConfig map[string]any `json:"generationConfig,omitempty"`
 	}{
 		Contents: []struct {
 			Parts []any `json:"parts"`
@@ -139,6 +140,12 @@ func callGemini(apiKey, workerURL, workerSecret, model string, imageBytes []byte
 				map[string]string{"text": aiPrompt},
 			},
 		}},
+	}
+	if model == defaultGeminiModel {
+		// Meme extraction does not need the model's default deep reasoning.
+		reqBody.GenerationConfig = map[string]any{
+			"thinkingConfig": map[string]string{"thinkingLevel": "low"},
+		}
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)

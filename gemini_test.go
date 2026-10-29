@@ -152,6 +152,19 @@ func TestCallGemini_ModelAndKeyHeader(t *testing.T) {
 				if r.Header.Get("x-goog-api-key") != "test-key" || r.URL.RawQuery != "" {
 					t.Error("API key must be sent in its header, never in the URL")
 				}
+				var body struct {
+					GenerationConfig struct {
+						ThinkingConfig struct {
+							ThinkingLevel string `json:"thinkingLevel"`
+						} `json:"thinkingConfig"`
+					} `json:"generationConfig"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if wantModel == defaultGeminiModel && body.GenerationConfig.ThinkingConfig.ThinkingLevel != "low" {
+					t.Error("the default model must use low thinking for image extraction")
+				}
 				json.NewEncoder(w).Encode(geminiResponse("ok"))
 			}))
 			defer srv.Close()
