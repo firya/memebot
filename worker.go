@@ -22,7 +22,7 @@ type indexJob struct {
 // workerIntervalEconom and workerIntervalBoost define the request cadence
 // for the two rate-limit modes selectable via /econom and /boost.
 const (
-	workerIntervalEconom = 4000 * time.Millisecond // local pacing; actual free limits depend on project/model
+	workerIntervalEconom = 12 * time.Second       // 5 RPM for the project's Gemini 3.8 Flash free tier
 	workerIntervalBoost  = 15 * time.Millisecond   // changes local pacing only, not the Google tier
 )
 
